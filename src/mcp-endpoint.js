@@ -15,13 +15,13 @@ function createServer({ nano, mcp, config }) {
       title: 'Ask a NanoGPT model',
       description:
         'Send a prompt to any model available on NanoGPT and return its reply. ' +
-        'Optionally let the model use the MCP tools configured on this server.',
+        "Optionally let the model use this server's read-only MCP tools (tools that change things need approval in the web UI).",
       inputSchema: {
         prompt: z.string().describe('The user prompt'),
         model: z.string().optional().describe(`Model id (default: ${config.defaultModel}). See list_models.`),
         system: z.string().optional().describe('Optional system prompt'),
         temperature: z.number().min(0).max(2).optional(),
-        use_tools: z.boolean().optional().describe("Let the model call this server's MCP tools (default false)"),
+        use_tools: z.boolean().optional().describe("Let the model call this server's read-only MCP tools (default false)"),
       },
     },
     async ({ prompt, model, system, temperature, use_tools }, extra) => {
@@ -33,6 +33,8 @@ function createServer({ nano, mcp, config }) {
         system,
         temperature,
         useTools: Boolean(use_tools),
+        // There is no one to approve tool calls here, so only offer tools that can't change anything.
+        readOnlyTools: true,
         maxRounds: config.maxToolRounds,
         signal: extra.signal,
       });

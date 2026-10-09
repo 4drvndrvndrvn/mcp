@@ -11,7 +11,9 @@ import { ROOT_DIR } from './config.js';
 
 const CLIENT_INFO = { name: 'nanogpt-mcp-chat', version: '1.0.0' };
 const CONNECT_TIMEOUT_MS = 30_000;
+// A tool call fails after 2 minutes without progress, or after 1 hour in total.
 const TOOL_TIMEOUT_MS = 120_000;
+const TOOL_MAX_TOTAL_MS = 60 * 60_000;
 const MAX_TOOL_RESULT_CHARS = 50_000;
 const SERVER_NAME_RE = /^[A-Za-z0-9_-]{1,40}$/;
 
@@ -111,32 +113,46 @@ export class McpManager {
     this.configPath = configPath;
     /** @type {Map<string, {config: object, client?: Client, status: string, error?: string, tools: object[], stderr: string[]}>} */
     this.servers = new Map();
+    this.bundled = [];
   }
 
   async _readConfigFile() {
     try {
-      const json = JSON.parse(await fs.readFile(this.configPath, 'utf8'));
-      return json.mcpServers || {};
+      return JSON.parse(await fs.readFile(this.configPath, 'utf8'));
     } catch (err) {
       if (err.code === 'ENOENT') return null;
       throw new Error(`Could not read ${this.configPath}: ${err.message}`);
     }
   }
 
-  async _saveConfigFile() {
-    const mcpServers = {};
-    for (const [name, entry] of this.servers) mcpServers[name] = entry.config;
-    await fs.writeFile(this.configPath, `${JSON.stringify({ mcpServers }, null, 2)}\n`);
+  async _saveConfigFile(servers = Object.fromEntries([...this.servers].map(([name, e]) => [name, e.config]))) {
+    const json = { mcpServers: servers, bundled: this.bundled };
+    await fs.writeFile(this.configPath, `${JSON.stringify(json, null, 2)}\n`);
   }
 
-  /** Loads the config file (creating it from the example if missing) and connects every enabled server. */
+  /**
+   * Loads the config file and connects every enabled server. Servers shipped in
+   * mcp-servers.example.json are added once; `bundled` remembers which were offered,
+   * so a server the user removed doesn't come back.
+   */
   async init() {
-    let servers = await this._readConfigFile();
-    if (servers === null) {
-      const example = JSON.parse(await fs.readFile(`${ROOT_DIR}/mcp-servers.example.json`, 'utf8'));
-      servers = example.mcpServers || {};
-      await fs.writeFile(this.configPath, `${JSON.stringify({ mcpServers: servers }, null, 2)}\n`);
-      console.log(`[mcp] created ${this.configPath} from mcp-servers.example.json`);
+    const example = JSON.parse(await fs.readFile(`${ROOT_DIR}/mcp-servers.example.json`, 'utf8')).mcpServers || {};
+    const file = await this._readConfigFile();
+    const servers = { ...(file?.mcpServers || {}) };
+    // Files from before `bundled` existed were created when only "demo" shipped.
+    this.bundled = file ? (Array.isArray(file.bundled) ? [...file.bundled] : ['demo']) : [];
+    const added = [];
+    for (const [name, cfg] of Object.entries(example)) {
+      if (this.bundled.includes(name)) continue;
+      this.bundled.push(name);
+      if (!servers[name]) {
+        servers[name] = cfg;
+        added.push(name);
+      }
+    }
+    if (!file || added.length || !Array.isArray(file.bundled)) {
+      await this._saveConfigFile(servers);
+      if (added.length) console.log(`[mcp] added bundled servers to ${this.configPath}: ${added.join(', ')}`);
     }
     for (const [name, raw] of Object.entries(servers)) {
       try {
@@ -291,7 +307,12 @@ export class McpManager {
       status: e.status,
       error: e.error || null,
       disabled: Boolean(e.config.disabled),
-      tools: e.tools.map((t) => ({ name: t.name, title: t.title || t.annotations?.title, description: t.description || '' })),
+      tools: e.tools.map((t) => ({
+        name: t.name,
+        title: t.title || t.annotations?.title,
+        description: t.description || '',
+        readOnly: t.annotations?.readOnlyHint === true,
+      })),
     }));
   }
 
@@ -299,16 +320,18 @@ export class McpManager {
    * Builds OpenAI `tools` for the given servers (all connected servers if omitted),
    * plus a lookup from function name back to {server, tool}.
    */
-  getOpenAITools(serverNames) {
+  getOpenAITools(serverNames, { readOnlyOnly = false } = {}) {
     const tools = [];
     const lookup = new Map();
     for (const [server, entry] of this.servers) {
       if (entry.status !== 'connected') continue;
       if (serverNames && !serverNames.includes(server)) continue;
       for (const tool of entry.tools) {
+        const readOnly = tool.annotations?.readOnlyHint === true;
+        if (readOnlyOnly && !readOnly) continue;
         let fnName = `${sanitizeName(server)}__${sanitizeName(tool.name)}`.slice(0, 64);
         for (let i = 2; lookup.has(fnName); i++) fnName = `${fnName.slice(0, 60)}_${i}`;
-        lookup.set(fnName, { server, tool: tool.name });
+        lookup.set(fnName, { server, tool: tool.name, readOnly });
         tools.push({
           type: 'function',
           function: {
@@ -322,13 +345,16 @@ export class McpManager {
     return { tools, lookup };
   }
 
-  async callTool(server, tool, args, { signal } = {}) {
+  async callTool(server, tool, args, { signal, onProgress } = {}) {
     const entry = this.servers.get(server);
     if (!entry?.client) throw new Error(`MCP server "${server}" is not connected`);
     return entry.client.callTool({ name: tool, arguments: args }, undefined, {
       signal,
       timeout: TOOL_TIMEOUT_MS,
+      maxTotalTimeout: TOOL_MAX_TOTAL_MS,
       resetTimeoutOnProgress: true,
+      // Asking for progress lets long-running tools keep the call alive and report status.
+      onprogress: (progress) => onProgress?.(progress),
     });
   }
 

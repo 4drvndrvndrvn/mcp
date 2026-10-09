@@ -89,6 +89,7 @@ const state = {
   model: store.get('model', null),
   toolsOnly: store.get('toolsOnly', false),
   useTools: store.get('useTools', true),
+  confirmTools: store.get('confirmTools', true),
   settings: store.get('settings', { system: '', temperature: null }),
   token: store.get('token', ''),
   conversations: store.get('conversations', []),
@@ -213,13 +214,38 @@ class TurnView {
     this.reasoning = null;
   }
 
-  toolCall({ id, name, server, tool, arguments: args }) {
+  toolCall({ id, name, server, tool, arguments: args, needsApproval }, onDecide) {
     const parts = splitToolName(name, server, tool);
     const status = el('span', { class: 'tool-state running' }, el('span', { class: 'spinner' }));
     const result = el('pre', {}, 'Running…');
+    let approval = null;
+    if (needsApproval && onDecide) {
+      status.className = 'tool-state running awaiting';
+      status.textContent = 'needs your approval';
+      result.textContent = 'Waiting for approval…';
+      const decide = async (approved) => {
+        for (const b of approval.querySelectorAll('button')) b.disabled = true;
+        try {
+          await onDecide(approved);
+          approval.remove();
+          if (approved) this.toolProgress({ id, message: 'running…' });
+          else status.textContent = 'denied';
+        } catch (err) {
+          for (const b of approval.querySelectorAll('button')) b.disabled = false;
+          alert(err.message);
+        }
+      };
+      approval = el(
+        'div',
+        { class: 'approval' },
+        el('span', {}, 'Run this tool?'),
+        el('button', { class: 'btn small primary', type: 'button', onclick: () => decide(true) }, 'Run'),
+        el('button', { class: 'btn small danger', type: 'button', onclick: () => decide(false) }, 'Deny'),
+      );
+    }
     const card = el(
       'details',
-      { class: 'tool' },
+      { class: 'tool', open: Boolean(approval) },
       el(
         'summary',
         {},
@@ -233,18 +259,27 @@ class TurnView {
         { class: 'tool-body' },
         el('div', { class: 'label' }, 'Arguments'),
         el('pre', {}, prettyJson(args || '{}')),
+        approval,
         el('div', { class: 'label' }, 'Result'),
         result,
       ),
     );
-    this.cards.set(id, { status, result });
+    this.cards.set(id, { status, result, card });
     this.add(card);
     scrollIfPinned();
+  }
+
+  toolProgress({ id, message }) {
+    const card = this.cards.get(id);
+    if (!card || !card.status.classList.contains('running')) return;
+    card.status.className = 'tool-state running';
+    card.status.replaceChildren(el('span', { class: 'spinner' }), message ? ` ${message}` : '');
   }
 
   toolResult({ id, content, isError }) {
     const card = this.cards.get(id);
     if (!card) return;
+    card.card.querySelector('.approval')?.remove();
     card.result.textContent = content || '(no output)';
     card.status.className = `tool-state ${isError ? 'err' : 'ok'}`;
     card.status.textContent = isError ? '✕ error' : '✓ done';
@@ -285,6 +320,7 @@ class TurnView {
         card.status.className = 'tool-state err';
         card.status.textContent = 'cancelled';
         card.result.textContent = 'Cancelled.';
+        card.card.querySelector('.approval')?.remove();
       }
     }
     if (!this.root.childElementCount) this.root.remove();
@@ -474,6 +510,9 @@ async function runTurn(conv) {
   let usage = null;
   let finished = false;
   let failure = null;
+  let runId = null;
+  const decide = (id) => (approved) =>
+    api('/api/chat/approve', { method: 'POST', body: { runId, id, approved } });
 
   const lastAssistant = () => [...added].reverse().find((m) => m.role === 'assistant');
 
@@ -487,10 +526,14 @@ async function runTurn(conv) {
         system: state.settings.system || undefined,
         temperature: state.settings.temperature ?? undefined,
         useTools: state.useTools,
+        confirmTools: state.confirmTools,
       },
     });
     for await (const event of readEvents(res.body)) {
       switch (event.type) {
+        case 'run':
+          runId = event.runId;
+          break;
         case 'reasoning':
           view.reasoningDelta(event.content);
           inProgress ||= { role: 'assistant', content: null };
@@ -507,7 +550,7 @@ async function runTurn(conv) {
           inProgress = null;
           break;
         case 'tool_call': {
-          view.toolCall(event);
+          view.toolCall(event, decide(event.id));
           const owner = lastAssistant();
           if (owner) {
             owner.tool_calls ||= [];
@@ -515,6 +558,9 @@ async function runTurn(conv) {
           }
           break;
         }
+        case 'tool_progress':
+          view.toolProgress(event);
+          break;
         case 'tool_result':
           view.toolResult(event);
           added.push({ role: 'tool', tool_call_id: event.id, content: event.content, isError: event.isError });
@@ -740,6 +786,12 @@ function updateToolsHint() {
   }
   $('#tools-hint').textContent = hint;
 }
+
+$('#confirm-tools').checked = state.confirmTools;
+$('#confirm-tools').addEventListener('change', (e) => {
+  state.confirmTools = e.target.checked;
+  store.set('confirmTools', state.confirmTools);
+});
 
 $('#use-tools').checked = state.useTools;
 $('#use-tools').addEventListener('change', (e) => {

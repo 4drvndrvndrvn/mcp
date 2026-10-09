@@ -3,7 +3,8 @@
 A small Node.js server and web chat UI for the [NanoGPT API](https://nano-gpt.com/api). You can chat with any of NanoGPT's 600+ models, and the model can call tools from any [MCP](https://modelcontextprotocol.io) server you connect.
 
 - **Web chat**: streams replies, renders Markdown, shows reasoning, and lets you search and filter models by tool support, vision and price. Chats are saved in your browser, and each reply shows its cost.
-- **MCP tools**: connect stdio, Streamable HTTP or SSE MCP servers from the UI or a config file. Their tools are passed to the model, which can call them over several rounds. Each call shows up as a card with its arguments and result.
+- **MCP tools**: connect stdio, Streamable HTTP or SSE MCP servers from the UI or a config file. Their tools are passed to the model, which can call them over several rounds. Each call shows up as a card with its arguments, live progress and result. Tools that can change things wait for you to click **Run**.
+- **Built-in Vast.ai and SSH tools**: the model can rent a GPU machine on [Vast.ai](https://vast.ai), run commands on it and destroy it, or run commands on any server over SSH.
 - **MCP server**: the app is also an MCP server at `/mcp`, so Claude Code, Claude Desktop, Cursor and other MCP clients can send prompts through NanoGPT models.
 
 ## Quick start
@@ -18,7 +19,61 @@ npm start
 
 Then open http://localhost:3000.
 
-On the first start the app creates `mcp-servers.json` from `mcp-servers.example.json`. That file connects a demo MCP server (`examples/demo-server.js`) with three tools: `get_current_time`, `calculate` and `random_number`. Try asking *"What time is it in Tokyo?"*.
+On the first start the app creates `mcp-servers.json` from `mcp-servers.example.json`, which connects three bundled MCP servers:
+
+| Server | Tools |
+| --- | --- |
+| `demo` (`examples/demo-server.js`) | `get_current_time`, `calculate`, `random_number`, `wait` |
+| `vast` (`servers/vast.js`) | Rent and drive Vast.ai machines, see [below](#vastai) |
+| `ssh` (`servers/ssh.js`) | Run commands and read/write files on remote hosts, see [below](#ssh) |
+
+Try asking *"What time is it in Tokyo?"*. Servers added to the example in a later version are added to your `mcp-servers.json` once on startup; if you remove one, it stays removed.
+
+## Approving tool calls
+
+With **Ask first** on (the default), any tool that isn't marked read-only (renting, destroying, running a command, writing a file…) shows its exact arguments and waits for you to click **Run** or **Deny**. Read-only tools, like searching offers or checking status, always run straight away. Turn **Ask first** off to let the model work unattended.
+
+A reply can use at most `MAX_TOOL_ROUNDS` rounds of tool calls. After that, the model gets up to 3 more rounds that may only clean up what it started (for example destroy a machine it rented), then it has to answer.
+
+## Vast.ai
+
+Add your API key from https://cloud.vast.ai/manage-keys/ to `.env` (searching works without it):
+
+```bash
+VAST_API_KEY=...
+```
+
+Then ask, for example:
+
+> Use the vast mcp: rent a cheap instance with a desktop image, download tuxbox (https://github.com/AndyCappDev/tuxbox) on it, wait 10 seconds and then destroy the instance.
+
+The model typically calls `vast_search_templates` (finds the official *Linux Desktop Container*), `vast_search_offers`, `vast_create_instance`, `vast_wait_for_instance`, `vast_exec` (runs `git clone …`), `wait` and `vast_destroy_instance`. Be specific about what to download: given just "tuxbox", a model has to guess which project you mean.
+
+| Tool | What it does |
+| --- | --- |
+| `vast_search_templates` | Finds ready-made images (desktop, PyTorch, ComfyUI, Ollama…). Only Vast.ai's recommended templates unless `include_community` is set. |
+| `vast_search_offers` | Finds machines by GPU, VRAM, price, reliability, country… With `template_hash`, only machines that can run that template. |
+| `vast_create_instance` | Rents a machine with a template or Docker image. Billing starts here. |
+| `vast_wait_for_instance` | Waits until the machine is running and accepts SSH, reporting progress while the image downloads. |
+| `vast_exec` | Runs a shell command on the machine as root. |
+| `vast_instance_logs` | Shows the container log. |
+| `vast_list_instances`, `vast_get_instance`, `vast_account` | Status, SSH address, price and remaining credit. |
+| `vast_start_instance`, `vast_stop_instance`, `vast_reboot_instance`, `vast_destroy_instance` | Lifecycle. Destroying deletes the machine and its data and stops billing. |
+| `vast_set_auto_destroy` | Changes or cancels an instance's auto-destroy deadline. |
+
+- The server creates its own SSH key (`.data/vast_ed25519`) and attaches it to each instance it creates, so `vast_exec` works without any SSH setup.
+- **Safety nets:** `auto_destroy_minutes` on `vast_create_instance` (or `VAST_AUTO_DESTROY_MINUTES` for all instances) destroys a machine even if the model never gets to it. Deadlines are saved in `.data/`, so one that passed while the app was off runs on the next start. `VAST_MAX_PRICE_PER_HOUR` refuses offers above that price.
+- With a template, the template's own startup script is kept. Run your commands with `vast_exec` after `vast_wait_for_instance`.
+
+## SSH
+
+`servers/ssh.js` provides `ssh_exec`, `ssh_read_file`, `ssh_write_file`, `ssh_list_hosts` and `ssh_public_key`. The model can pass `host` as a hostname, `user@host:port`, or a name from `SSH_HOSTS_FILE`:
+
+```json
+{ "gpu": { "host": "203.0.113.7", "port": 22, "username": "root" } }
+```
+
+It logs in with `SSH_KEY_PATH` (default `~/.ssh/id_ed25519`, `id_ecdsa` or `id_rsa`), your ssh-agent, or a `password` in the hosts file. Host keys are checked against `~/.ssh/known_hosts`: a changed key is refused, and unknown hosts are accepted unless `SSH_STRICT_HOST_KEY_CHECKING=yes`. `SSH_ALLOWED_HOSTS` (e.g. `*.example.com,10.0.0.*`) limits where the model can connect.
 
 ## Adding MCP servers
 
@@ -57,7 +112,7 @@ Click **MCP servers** in the sidebar to add, reconnect, disable or remove server
 
 | Tool | What it does |
 | --- | --- |
-| `chat` | Sends a `prompt` (plus optional `model`, `system`, `temperature`, `use_tools`) to NanoGPT and returns the reply. With `use_tools: true`, the model can also use the MCP servers configured above. |
+| `chat` | Sends a `prompt` (plus optional `model`, `system`, `temperature`, `use_tools`) to NanoGPT and returns the reply. With `use_tools: true`, the model can also use the read-only tools of the MCP servers configured above (there's nobody to approve the others). |
 | `list_models` | Lists model ids, optionally filtered by `search` or `tool_calling_only`. |
 
 Claude Code:
@@ -83,16 +138,27 @@ Clients that only support stdio can use [`mcp-remote`](https://www.npmjs.com/pac
 | `HOST` | `127.0.0.1` | Interface to listen on. |
 | `PORT` | `3000` | Port to listen on. |
 | `ACCESS_TOKEN` | — | If set, the API and `/mcp` require `Authorization: Bearer <token>`. The UI asks for it once. |
-| `MAX_TOOL_ROUNDS` | `10` | The most rounds of tool calls in one reply. |
+| `MAX_TOOL_ROUNDS` | `20` | Rounds of tool calls in one reply, before the 3 clean-up rounds. |
 | `MCP_CONFIG` | `./mcp-servers.json` | Path to the MCP servers file. |
 | `NANOGPT_BASE_URL` | `https://nano-gpt.com/api/v1` | API base URL. |
+| `VAST_API_KEY` | — | Vast.ai API key for the `vast` server. |
+| `VAST_MAX_PRICE_PER_HOUR` | — | Refuse to rent offers above this $/hr. |
+| `VAST_AUTO_DESTROY_MINUTES` | — | Default auto-destroy deadline for new instances. |
+| `VAST_SSH_KEY_PATH` | `.data/vast_ed25519` | Key used to reach instances (created if missing). |
+| `SSH_KEY_PATH`, `SSH_KEY_PASSPHRASE` | `~/.ssh/id_*` | Key for the `ssh` server. |
+| `SSH_HOSTS_FILE` | — | JSON file of named hosts. |
+| `SSH_ALLOWED_HOSTS` | any | Comma-separated hostname patterns the model may connect to. |
+| `SSH_DEFAULT_USER` | `root` | User when none is given. |
+| `SSH_STRICT_HOST_KEY_CHECKING` | — | `yes` refuses hosts that aren't in known_hosts. |
+
+The bundled servers read their settings from `.env` themselves.
 
 ## Security
 
 - By default the server listens only on `127.0.0.1` and rejects requests whose `Host` header isn't `localhost`, `127.0.0.1` or `[::1]`, which blocks DNS-rebinding attacks.
 - **Set `ACCESS_TOKEN` before using `HOST=0.0.0.0`.** Anyone who can reach the port can spend your NanoGPT credits. A stdio MCP server runs a command on the host, so without a token the UI can't add stdio servers when the host is public.
-- MCP tools run with your permissions. Only connect servers you trust, and be careful with tools that write files or run commands.
-- `.env` and `mcp-servers.json` are git-ignored because they can hold secrets.
+- MCP tools run with your permissions. Only connect servers you trust, and keep **Ask first** on unless you trust the model with what the tools can do: `ssh_exec` and `vast_exec` run arbitrary commands, and `vast_create_instance` spends money.
+- `.env`, `mcp-servers.json`, `ssh-hosts.json` and `.data/` (the Vast SSH key) are git-ignored because they hold secrets.
 
 ## HTTP API
 
@@ -105,9 +171,10 @@ Clients that only support stdio can use [`mcp-remote`](https://www.npmjs.com/pac
 | `PATCH /api/mcp/servers/:name` | `{ "disabled": true \| false }` |
 | `POST /api/mcp/servers/:name/reconnect` | Reconnects a server. |
 | `DELETE /api/mcp/servers/:name` | Removes a server. |
-| `POST /api/chat` | `{ model, messages, system?, temperature?, useTools?, servers? }` returns a Server-Sent Events stream. |
+| `POST /api/chat` | `{ model, messages, system?, temperature?, useTools?, servers?, confirmTools? }` returns a Server-Sent Events stream. |
+| `POST /api/chat/approve` | `{ runId, id, approved }` answers a tool call that is waiting for approval. |
 
-`/api/chat` sends one JSON event per message: `delta` and `reasoning` (text chunks), `assistant_end`, `tool_call`, `tool_result`, `notice`, `usage`, `error`, and finally `done`. The `done` event carries `messages`: everything added during the turn (assistant messages, tool calls and tool results) in OpenAI format. Append them to your history for the next request.
+`/api/chat` sends one JSON event per message: `run` (with the `runId`), `delta` and `reasoning` (text chunks), `assistant_end`, `tool_call` (with `needsApproval`), `tool_progress`, `tool_result`, `notice`, `usage`, `error`, and finally `done`. The `done` event carries `messages`: everything added during the turn (assistant messages, tool calls and tool results) in OpenAI format. Append them to your history for the next request. `confirmTools` defaults to `true`; send `false` to run every tool without asking.
 
 ## Development
 
@@ -123,5 +190,9 @@ src/mcp.js             MCP client manager (stdio / HTTP / SSE, tool mapping)
 src/agent.js           Tool-calling loop between the model and MCP servers
 src/mcp-endpoint.js    This app as an MCP server
 public/                Web UI (no build step)
+servers/vast.js        Vast.ai MCP server
+servers/ssh.js         SSH MCP server
+servers/lib/           Vast.ai API client, SSH connection pool
 examples/              Demo stdio MCP server
+test/helpers/          Throwaway SSH server and a mock Vast.ai API used by the tests
 ```

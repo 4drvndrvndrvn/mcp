@@ -22,7 +22,7 @@ export const config = {
   port: num(process.env.PORT, 3000),
   accessToken: process.env.ACCESS_TOKEN || '',
   mcpConfigPath: path.resolve(ROOT_DIR, process.env.MCP_CONFIG || 'mcp-servers.json'),
-  maxToolRounds: num(process.env.MAX_TOOL_ROUNDS, 10),
+  maxToolRounds: num(process.env.MAX_TOOL_ROUNDS, 20),
 };
 
 export function isLoopbackHost(host) {

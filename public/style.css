@@ -221,6 +221,12 @@ details.tool[open] summary::after { transform: rotate(90deg); }
 .tool-state.running { color: var(--warn); }
 .tool-state.ok { color: var(--ok); }
 .tool-state.err { color: var(--danger); }
+.tool-state.awaiting { color: var(--warn); font-weight: 600; }
+.approval {
+  display: flex; align-items: center; gap: 8px; margin: 10px 0 4px;
+  padding: 8px 10px; border-radius: 8px; background: var(--accent-soft);
+}
+.approval span { flex: 1; font-weight: 600; }
 .tool-body { border-top: 1px solid var(--border); padding: 8px 12px 10px; }
 .tool-body .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 6px 0 3px; }
 .tool-body pre {
@@ -244,7 +250,7 @@ details.tool[open] summary::after { transform: rotate(90deg); }
 }
 .composer-inner:focus-within { border-color: var(--accent); }
 #input { border: 0; background: transparent; resize: none; padding: 4px 2px; max-height: 40vh; }
-.composer-bar { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+.composer-bar { display: flex; align-items: center; gap: 10px 14px; margin-top: 6px; flex-wrap: wrap; }
 .hint { font-size: 12px; color: var(--warn); }
 .toggle { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; font-size: 13.5px; color: var(--muted); user-select: none; }
 .toggle input { position: absolute; opacity: 0; pointer-events: none; }

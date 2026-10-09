@@ -5,6 +5,14 @@ import { toolResultToText } from './mcp.js';
 
 const ROLES = new Set(['system', 'user', 'assistant', 'tool']);
 
+// After the tool budget is spent, the model gets a few more rounds to clean up what it
+// started (e.g. destroy a rented machine) before tools are switched off.
+const WRAP_UP_ROUNDS = 3;
+const WRAP_UP_NOTE =
+  '[Automatic notice from the chat app, not from the user] You have used up your tool-call budget for this reply. ' +
+  'Only make tool calls that clean up what you started (for example destroy or stop machines you created), ' +
+  'then reply to the user with a summary of what was and was not done. Do not start new work.';
+
 /** Keeps only the fields the chat completions API understands. */
 export function sanitizeMessages(messages) {
   if (!Array.isArray(messages)) throw new Error('"messages" must be an array');
@@ -30,6 +38,7 @@ export function sanitizeMessages(messages) {
  * @param {import('./nanogpt.js').NanoGPT} opts.nano
  * @param {import('./mcp.js').McpManager} opts.mcp
  * @param {(event: object) => void} opts.emit  receives streaming events for the UI
+ * @param {(call: object) => Promise<boolean>} [opts.approve]  asked before running tools that aren't read-only
  * @returns {Promise<object[]>} the messages added during this turn
  */
 export async function runAgent({
@@ -41,7 +50,9 @@ export async function runAgent({
   temperature,
   useTools = true,
   servers,
-  maxRounds = 10,
+  readOnlyTools = false,
+  approve,
+  maxRounds = 20,
   signal,
   emit = () => {},
 }) {
@@ -52,7 +63,7 @@ export async function runAgent({
   let tools = [];
   let lookup = new Map();
   if (useTools) {
-    ({ tools, lookup } = mcp.getOpenAITools(servers));
+    ({ tools, lookup } = mcp.getOpenAITools(servers, { readOnlyOnly: readOnlyTools }));
     if (tools.length) {
       const info = await nano.getModel(model);
       if (info && info.toolCalling === false) {
@@ -65,10 +76,10 @@ export async function runAgent({
   const prefix = system ? [{ role: 'system', content: system }] : [];
 
   for (let round = 1; ; round++) {
-    // After maxRounds rounds of tool use, forbid more calls so the model answers in text.
-    const allowTools = tools.length > 0 && round <= maxRounds;
-    if (tools.length && !allowTools) {
-      emit({ type: 'notice', message: `Reached the limit of ${maxRounds} tool rounds; asking the model to answer now.` });
+    const wrapUp = tools.length > 0 && round > maxRounds && round <= maxRounds + WRAP_UP_ROUNDS;
+    const allowTools = tools.length > 0 && round <= maxRounds + WRAP_UP_ROUNDS;
+    if (tools.length && round === maxRounds + 1) {
+      emit({ type: 'notice', message: `Reached the limit of ${maxRounds} tool rounds; asking the model to clean up and answer.` });
     }
 
     let content = '';
@@ -80,7 +91,7 @@ export async function runAgent({
 
     const stream = nano.streamChat({
       model,
-      messages: [...prefix, ...history, ...sanitizeMessages(added)],
+      messages: [...prefix, ...history, ...sanitizeMessages(added), ...(wrapUp ? [{ role: 'user', content: WRAP_UP_NOTE }] : [])],
       tools,
       toolChoice: allowTools ? undefined : 'none',
       temperature,
@@ -143,6 +154,8 @@ export async function runAgent({
 
     for (const call of toolCalls) {
       const target = lookup.get(call.function.name);
+      // Tools that only read never need approval; everything else does when `approve` is set.
+      const needsApproval = Boolean(approve && target && !target.readOnly);
       emit({
         type: 'tool_call',
         id: call.id,
@@ -150,6 +163,7 @@ export async function runAgent({
         server: target?.server,
         tool: target?.tool,
         arguments: call.function.arguments,
+        needsApproval,
       });
 
       let text;
@@ -162,9 +176,18 @@ export async function runAgent({
         } catch {
           throw new Error(`Tool arguments are not valid JSON: ${call.function.arguments}`);
         }
-        const result = await mcp.callTool(target.server, target.tool, args, { signal });
-        text = toolResultToText(result);
-        isError = Boolean(result.isError);
+        if (needsApproval && !(await approve({ id: call.id, server: target.server, tool: target.tool, args }))) {
+          if (signal?.aborted) throw new Error('Cancelled');
+          text = 'The user declined to run this tool call. Ask them how to proceed instead of retrying it.';
+          isError = true;
+        } else {
+          const result = await mcp.callTool(target.server, target.tool, args, {
+            signal,
+            onProgress: (p) => emit({ type: 'tool_progress', id: call.id, message: p.message || '', progress: p.progress, total: p.total }),
+          });
+          text = toolResultToText(result);
+          isError = Boolean(result.isError);
+        }
       } catch (err) {
         if (signal?.aborted) throw err;
         text = `Error: ${err.message}`;

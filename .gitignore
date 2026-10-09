@@ -1,5 +1,7 @@
 node_modules/
 .env
 mcp-servers.json
+.data/
+ssh-hosts.json
 *.log
 .DS_Store

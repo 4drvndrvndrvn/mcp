@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { timingSafeEqual } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import express from 'express';
 import { config, isLoopbackHost, ROOT_DIR } from './src/config.js';
 import { NanoGPT } from './src/nanogpt.js';
@@ -104,8 +104,19 @@ app.post('/api/mcp/servers/:name/reconnect', async (req, res) => {
   res.json({ servers: mcp.list() });
 });
 
+// Tool calls waiting for the user to approve or deny them, keyed by `${runId}:${callId}`.
+const pendingApprovals = new Map();
+
+app.post('/api/chat/approve', (req, res) => {
+  const { runId, id, approved } = req.body || {};
+  const pending = pendingApprovals.get(`${runId}:${id}`);
+  if (!pending) return res.status(404).json({ error: 'No tool call is waiting for approval with that id' });
+  pending(Boolean(approved));
+  res.json({ ok: true });
+});
+
 app.post('/api/chat', async (req, res) => {
-  const { model, messages, system, temperature, useTools = true, servers } = req.body || {};
+  const { model, messages, system, temperature, useTools = true, servers, confirmTools = true } = req.body || {};
   if (!model || !Array.isArray(messages)) {
     return res.status(400).json({ error: '"model" and "messages" are required' });
   }
@@ -123,6 +134,22 @@ app.post('/api/chat', async (req, res) => {
   const abort = new AbortController();
   res.on('close', () => abort.abort());
 
+  const runId = randomUUID();
+  send({ type: 'run', runId });
+  const approve = (call) =>
+    new Promise((resolve) => {
+      const key = `${runId}:${call.id}`;
+      const finish = (approved) => {
+        pendingApprovals.delete(key);
+        abort.signal.removeEventListener('abort', onAbort);
+        resolve(approved);
+      };
+      const onAbort = () => finish(false);
+      if (abort.signal.aborted) return resolve(false);
+      pendingApprovals.set(key, finish);
+      abort.signal.addEventListener('abort', onAbort, { once: true });
+    });
+
   try {
     const added = await runAgent({
       nano,
@@ -133,6 +160,7 @@ app.post('/api/chat', async (req, res) => {
       temperature: typeof temperature === 'number' ? temperature : undefined,
       useTools: Boolean(useTools),
       servers: Array.isArray(servers) ? servers : undefined,
+      approve: confirmTools === false ? undefined : approve,
       maxRounds: config.maxToolRounds,
       signal: abort.signal,
       emit: send,
