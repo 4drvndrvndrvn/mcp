@@ -1,0 +1,23 @@
+{
+  "name": "nanogpt-mcp-chat",
+  "version": "1.0.0",
+  "description": "Web chat for NanoGPT models with MCP tool support, plus an MCP server endpoint",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20.12"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "dompurify": "^3.4.16",
+    "express": "^5.3.0",
+    "marked": "^18.1.0",
+    "zod": "^4.6.5"
+  }
+}

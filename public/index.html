@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NanoGPT Chat</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%236366f1'/><text x='16' y='22' font-size='16' text-anchor='middle' fill='white' font-family='sans-serif'>N</text></svg>">
+  <link rel="stylesheet" href="style.css">
+  <script src="/vendor/marked.js"></script>
+  <script src="/vendor/purify.js"></script>
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <div class="app" id="app">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <span class="logo">N</span>
+        <span>NanoGPT Chat</span>
+      </div>
+      <button id="new-chat" class="btn primary block">+ New chat</button>
+      <nav id="conversations" class="conversations" aria-label="Conversations"></nav>
+      <div class="sidebar-footer">
+        <button id="open-mcp" class="btn ghost block">
+          <span>MCP servers</span><span id="mcp-count" class="pill"></span>
+        </button>
+        <button id="open-settings" class="btn ghost block">Settings</button>
+      </div>
+    </aside>
+    <div class="scrim" id="scrim"></div>
+
+    <main class="main">
+      <header class="topbar">
+        <button id="toggle-sidebar" class="icon-btn" aria-label="Toggle sidebar">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+        </button>
+        <div class="model-picker" id="model-picker">
+          <button id="model-button" class="model-button" aria-haspopup="listbox">
+            <span id="model-name">Loading models…</span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg>
+          </button>
+          <div id="model-menu" class="model-menu" hidden>
+            <input id="model-search" type="search" placeholder="Search models…" autocomplete="off">
+            <label class="check"><input type="checkbox" id="tools-only"> Tool-capable only</label>
+            <ul id="model-list" role="listbox"></ul>
+          </div>
+        </div>
+        <div class="spacer"></div>
+        <span id="cost" class="cost" title="Cost of this conversation"></span>
+      </header>
+
+      <section id="messages" class="messages" aria-live="polite"></section>
+
+      <form id="composer" class="composer">
+        <div class="composer-inner">
+          <textarea id="input" rows="1" placeholder="Message the model…"></textarea>
+          <div class="composer-bar">
+            <label class="toggle" title="Let the model call tools from your MCP servers">
+              <input type="checkbox" id="use-tools" checked>
+              <span class="switch"></span>
+              <span id="tools-label">MCP tools</span>
+            </label>
+            <span id="tools-hint" class="hint"></span>
+            <div class="spacer"></div>
+            <button type="submit" id="send" class="btn primary">Send</button>
+          </div>
+        </div>
+      </form>
+    </main>
+  </div>
+
+  <dialog id="mcp-dialog" class="dialog wide">
+    <div class="dialog-head">
+      <h2>MCP servers</h2>
+      <button class="icon-btn" data-close aria-label="Close">✕</button>
+    </div>
+    <p class="muted">Tools from connected servers are offered to the model. Servers are saved in <code>mcp-servers.json</code>.</p>
+    <div id="server-list" class="server-list"></div>
+
+    <h3>Add a server</h3>
+    <form id="add-server" class="form">
+      <div class="row">
+        <label>Name <input name="name" required pattern="[A-Za-z0-9_\-]{1,40}" placeholder="filesystem"></label>
+        <label>Type
+          <select name="type">
+            <option value="stdio">stdio (local command)</option>
+            <option value="http">Streamable HTTP (URL)</option>
+            <option value="sse">SSE (legacy URL)</option>
+          </select>
+        </label>
+      </div>
+      <div data-for="stdio">
+        <label>Command <input name="command" placeholder="npx"></label>
+        <label><span>Arguments <span class="muted">(one per line)</span></span>
+          <textarea name="args" rows="3" placeholder="-y&#10;@modelcontextprotocol/server-filesystem&#10;/path/to/folder"></textarea>
+        </label>
+        <label><span>Environment <span class="muted">(KEY=value per line, ${VAR} reads from the server's env)</span></span>
+          <textarea name="env" rows="2" placeholder="API_KEY=${MY_API_KEY}"></textarea>
+        </label>
+      </div>
+      <div data-for="http sse" hidden>
+        <label>URL <input name="url" type="url" placeholder="https://example.com/mcp"></label>
+        <label><span>Headers <span class="muted">(Name: value per line)</span></span>
+          <textarea name="headers" rows="2" placeholder="Authorization: Bearer ${MY_TOKEN}"></textarea>
+        </label>
+      </div>
+      <p id="stdio-note" class="note" hidden></p>
+      <details class="paste-json">
+        <summary>…or paste a JSON config</summary>
+        <textarea name="json" rows="6" placeholder='{"mcpServers": {"fetch": {"command": "uvx", "args": ["mcp-server-fetch"]}}}'></textarea>
+      </details>
+      <div class="form-actions">
+        <span id="add-status" class="muted"></span>
+        <button type="submit" class="btn primary">Add &amp; connect</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="settings-dialog" class="dialog">
+    <div class="dialog-head">
+      <h2>Settings</h2>
+      <button class="icon-btn" data-close aria-label="Close">✕</button>
+    </div>
+    <form id="settings-form" class="form" method="dialog">
+      <label>System prompt
+        <textarea name="system" rows="5" placeholder="You are a helpful assistant."></textarea>
+      </label>
+      <label><span>Temperature <span class="muted">(blank = model default)</span></span>
+        <input name="temperature" type="number" min="0" max="2" step="0.1" placeholder="default">
+      </label>
+      <label id="token-field" hidden>Access token
+        <input name="token" type="password" autocomplete="current-password" placeholder="ACCESS_TOKEN from the server's .env">
+      </label>
+      <div class="form-actions">
+        <button type="button" id="clear-chats" class="btn danger">Delete all chats</button>
+        <div class="spacer"></div>
+        <button type="submit" class="btn primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>
