@@ -4,7 +4,7 @@ A small Node.js server and web chat UI for the [NanoGPT API](https://nano-gpt.co
 
 - **Web chat**: streams replies, renders Markdown, shows reasoning, and lets you search and filter models by tool support, vision and price. Chats are saved in your browser, and each reply shows its cost.
 - **MCP tools**: connect stdio, Streamable HTTP or SSE MCP servers from the UI or a config file. Their tools are passed to the model, which can call them over several rounds. Each call shows up as a card with its arguments, live progress and result. Tools that can change things wait for you to click **Run**.
-- **Built-in Vast.ai and SSH tools**: the model can rent a GPU machine on [Vast.ai](https://vast.ai), run commands on it and destroy it, or run commands on any server over SSH.
+- **Built-in Vast.ai, SSH and web search tools**: the model can rent a GPU machine on [Vast.ai](https://vast.ai), run commands on it and destroy it, run commands on any server over SSH, and look things up on the web instead of guessing.
 - **MCP server**: the app is also an MCP server at `/mcp`, so Claude Code, Claude Desktop, Cursor and other MCP clients can send prompts through NanoGPT models.
 
 ## Quick start
@@ -26,6 +26,7 @@ On the first start the app creates `mcp-servers.json` from `mcp-servers.example.
 | `demo` (`examples/demo-server.js`) | `get_current_time`, `calculate`, `random_number`, `wait` |
 | `vast` (`servers/vast.js`) | Rent and drive Vast.ai machines, see [below](#vastai) |
 | `ssh` (`servers/ssh.js`) | Run commands and read/write files on remote hosts, see [below](#ssh) |
+| `web` (`servers/web.js`) | `web_search`: answers with sources from a NanoGPT `:online` model (a few cents per search) |
 
 Try asking *"What time is it in Tokyo?"*. Servers added to the example in a later version are added to your `mcp-servers.json` once on startup; if you remove one, it stays removed.
 
@@ -45,9 +46,21 @@ VAST_API_KEY=...
 
 Then ask, for example:
 
-> Use the vast mcp: rent a cheap instance with a desktop image, download tuxbox (https://github.com/AndyCappDev/tuxbox) on it, wait 10 seconds and then destroy the instance.
+> Use the vast mcp: rent a cheap instance with a desktop image, download tuxblox on it, wait 10 seconds and then close the vast instance (destroy it).
 
-The model typically calls `vast_search_templates` (finds the official *Linux Desktop Container*), `vast_search_offers`, `vast_create_instance`, `vast_wait_for_instance`, `vast_exec` (runs `git clone …`), `wait` and `vast_destroy_instance`. Be specific about what to download: given just "tuxbox", a model has to guess which project you mean.
+The model typically calls:
+1. `web_search` to find out what [TuxBlox](https://tuxblox.net) is (Roblox Studio on Linux) and how it's installed.
+2. `vast_search_templates`, which finds the official *Linux Desktop Container*.
+3. `vast_search_offers`.
+4. `vast_create_instance`, usually with an `auto_destroy_minutes` safety net.
+5. `vast_wait_for_instance`.
+6. `vast_exec` with `run_as_user: "user"`, running `curl -sSLf https://tuxblox.net/install.sh | bash`. TuxBlox's installer refuses to run as root, and instances are root by default.
+7. `wait`.
+8. `vast_destroy_instance`.
+
+Without `web_search`, models that don't know a program invent download URLs. Naming the source in the prompt (e.g. "tuxblox from https://tuxblox.net") works too.
+
+About TuxBlox itself: it's a new, small project whose installer is an unsigned binary. It only *runs* on hosts with Linux kernel 6.7 or newer and a Vulkan driver (`uname -r`, `vulkaninfo --summary`), and Roblox Studio needs you to sign in from the desktop session.
 
 | Tool | What it does |
 | --- | --- |
@@ -55,7 +68,7 @@ The model typically calls `vast_search_templates` (finds the official *Linux Des
 | `vast_search_offers` | Finds machines by GPU, VRAM, price, reliability, country… With `template_hash`, only machines that can run that template. |
 | `vast_create_instance` | Rents a machine with a template or Docker image. Billing starts here. |
 | `vast_wait_for_instance` | Waits until the machine is running and accepts SSH, reporting progress while the image downloads. |
-| `vast_exec` | Runs a shell command on the machine as root. |
+| `vast_exec` | Runs a shell command on the machine, as root or, with `run_as_user`, as a normal user (created if missing) for installers that refuse root. |
 | `vast_instance_logs` | Shows the container log. |
 | `vast_list_instances`, `vast_get_instance`, `vast_account` | Status, SSH address, price and remaining credit. |
 | `vast_start_instance`, `vast_stop_instance`, `vast_reboot_instance`, `vast_destroy_instance` | Lifecycle. Destroying deletes the machine and its data and stops billing. |
@@ -103,7 +116,7 @@ Click **MCP servers** in the sidebar to add, reconnect, disable or remove server
 
 - `type` is `stdio` (the default when `command` is set), `http` (the default when `url` is set) or `sse`. An `http` server that doesn't support Streamable HTTP is retried over SSE.
 - In `args`, `env`, `url` and `headers`, `${VAR}` is replaced with the value of that environment variable on the server, so secrets can stay in `.env`.
-- Stdio servers get only a minimal environment (PATH, HOME, …) plus whatever you list in `env`. Your NanoGPT key is not passed to them.
+- Stdio servers get only a minimal environment (PATH, HOME, …), your proxy and CA-certificate settings (`HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS`, …) so they can reach the internet, and whatever you list in `env`. Your NanoGPT key is not passed to them.
 - Tools are offered to the model only when the **MCP tools** switch is on and the selected model supports tool calling. A model can make at most `MAX_TOOL_ROUNDS` rounds of tool calls per reply.
 
 ## Using it as an MCP server
@@ -150,6 +163,7 @@ Clients that only support stdio can use [`mcp-remote`](https://www.npmjs.com/pac
 | `SSH_ALLOWED_HOSTS` | any | Comma-separated hostname patterns the model may connect to. |
 | `SSH_DEFAULT_USER` | `root` | User when none is given. |
 | `SSH_STRICT_HOST_KEY_CHECKING` | — | `yes` refuses hosts that aren't in known_hosts. |
+| `WEB_SEARCH_MODEL` | `openai/gpt-5.4-mini:online` | Model used by `web_search` (any NanoGPT model id with `:online`). |
 
 The bundled servers read their settings from `.env` themselves.
 
@@ -192,6 +206,7 @@ src/mcp-endpoint.js    This app as an MCP server
 public/                Web UI (no build step)
 servers/vast.js        Vast.ai MCP server
 servers/ssh.js         SSH MCP server
+servers/web.js         Web search MCP server
 servers/lib/           Vast.ai API client, SSH connection pool
 examples/              Demo stdio MCP server
 test/helpers/          Throwaway SSH server and a mock Vast.ai API used by the tests

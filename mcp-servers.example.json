@@ -2,16 +2,30 @@
   "mcpServers": {
     "demo": {
       "command": "node",
-      "args": ["examples/demo-server.js"]
+      "args": [
+        "examples/demo-server.js"
+      ]
     },
     "vast": {
       "command": "node",
-      "args": ["servers/vast.js"]
+      "args": [
+        "servers/vast.js"
+      ]
     },
     "ssh": {
       "command": "node",
-      "args": ["servers/ssh.js"],
-      "env": { "SSH_AUTH_SOCK": "${SSH_AUTH_SOCK}" }
+      "args": [
+        "servers/ssh.js"
+      ],
+      "env": {
+        "SSH_AUTH_SOCK": "${SSH_AUTH_SOCK}"
+      }
+    },
+    "web": {
+      "command": "node",
+      "args": [
+        "servers/web.js"
+      ]
     }
   }
 }

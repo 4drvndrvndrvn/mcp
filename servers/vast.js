@@ -14,7 +14,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { ROOT_DIR, loadEnv, progressReporter, safe, sleep, text } from './lib/common.js';
-import { SshPool, ensureKeyPair, formatExecResult } from './lib/ssh.js';
+import { SshPool, asUser, ensureKeyPair, formatExecResult } from './lib/ssh.js';
 import {
   VastAPI,
   VAST_DEFAULT_URL,
@@ -463,28 +463,37 @@ server.registerTool(
   {
     title: 'Run a command on a Vast.ai instance',
     description:
-      'Run a shell command (as root) on a running instance over SSH and return its output, e.g. to download or install software. ' +
-      'Call vast_wait_for_instance first. For long jobs raise timeout_seconds or use nohup ... &.',
+      'Run a shell command on a running instance over SSH and return its output, e.g. to download or install software. ' +
+      'Commands run as root unless run_as_user is set; many Linux installers and apps refuse to run as root, so use ' +
+      'run_as_user for those. Call vast_wait_for_instance first. For long jobs raise timeout_seconds or use nohup ... &.',
     inputSchema: {
       instance_id: instanceId,
       command: z.string().describe('Shell command to run'),
+      run_as_user: z
+        .string()
+        .regex(/^[a-z_][a-z0-9_-]{0,31}$/)
+        .optional()
+        .describe('Run as this normal user in a login shell, created if missing, e.g. "user" ("root" or omitted runs as root)'),
       timeout_seconds: z.number().int().min(1).max(3600).optional().describe('Stop the command after this long (default 300)'),
     },
     annotations: { destructiveHint: true, openWorldHint: true },
   },
-  safe(async ({ instance_id, command, timeout_seconds = 300 }, extra) => {
+  safe(async ({ instance_id, command, run_as_user, timeout_seconds = 300 }, extra) => {
     const inst = await requireInstance(instance_id, extra.signal);
     if (instanceStatus(inst) !== 'running') {
       return text(`Instance ${instance_id} is ${instanceStatus(inst)}, not running. Call vast_wait_for_instance first.`, true);
     }
     await attachKey(instance_id, extra.signal);
     const timeoutMs = timeout_seconds * 1000;
-    const { endpoint, result } = await execOnInstance(inst, command, {
+    const asOther = run_as_user && run_as_user !== 'root';
+    const remote = asOther ? asUser(run_as_user, command) : command;
+    const { endpoint, result } = await execOnInstance(inst, remote, {
       timeoutMs,
       signal: extra.signal,
       onProgress: progressReporter(extra),
     });
-    return text(formatExecResult(`instance ${instance_id} via ${endpoint.kind} ssh`, command, result, timeoutMs), result.timedOut);
+    const where = `instance ${instance_id} via ${endpoint.kind} ssh, as ${asOther ? run_as_user : 'root'}`;
+    return text(formatExecResult(where, command, result, timeoutMs), result.timedOut);
   }),
 );
 

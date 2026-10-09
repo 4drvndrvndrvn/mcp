@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { sseData } from '../src/nanogpt.js';
-import { expandEnv, normalizeServerConfig, sanitizeName, toolResultToText } from '../src/mcp.js';
+import { childEnv, expandEnv, normalizeServerConfig, sanitizeName, toolResultToText } from '../src/mcp.js';
 import { evaluate } from '../examples/calc.js';
 
 const streamOf = (...parts) =>
@@ -59,4 +59,11 @@ test('calculator evaluates safely', () => {
   assert.equal(evaluate('max(1, sqrt(16), 3)'), 4);
   assert.throws(() => evaluate('process.exit()'));
   assert.throws(() => evaluate('1 +'));
+});
+
+test('childEnv passes network settings through but not secrets', () => {
+  const parent = { HTTPS_PROXY: 'http://proxy:8080', NODE_EXTRA_CA_CERTS: '/ca.pem', NANOGPT_API_KEY: 'secret', HOME: '/h' };
+  process.env.TEST_CHILD_TOKEN = 'tok';
+  const env = childEnv({ TOKEN: '${TEST_CHILD_TOKEN}', HTTPS_PROXY: 'http://other:1' }, parent);
+  assert.deepEqual(env, { HTTPS_PROXY: 'http://other:1', NODE_EXTRA_CA_CERTS: '/ca.pem', TOKEN: 'tok' });
 });

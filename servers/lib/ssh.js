@@ -18,6 +18,16 @@ export const expandHome = (p) => (p && p.startsWith('~') ? path.join(os.homedir(
 /** Quotes a string for a POSIX shell. */
 export const shellQuote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 
+/**
+ * Wraps a command to run as a normal user in a login shell, creating the user if needed
+ * (for installers and apps that refuse to run as root). `user` must be a safe username.
+ */
+export function asUser(user, command) {
+  if (!/^[a-z_][a-z0-9_-]{0,31}$/.test(user)) throw new Error(`Invalid username: ${user}`);
+  if (user === 'root') throw new Error('run_as_user must be a normal user such as "user"; leave it out to run as root.');
+  return `{ id -u ${user} >/dev/null 2>&1 || useradd -m -s /bin/bash ${user}; } && runuser -l ${user} -c ${shellQuote(command)}`;
+}
+
 /** Strips ANSI escapes and collapses carriage-return progress bars to their final state. */
 export function cleanOutput(s) {
   return s

@@ -36,6 +36,8 @@ export async function startVastMock({
   runtype = 'jupyter',
   // Commands sent to instances run here (a fresh temp dir by default, never the repo).
   instanceCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'vast-instance-')),
+  // Optional: answer instance commands without running them (see startSshServer).
+  execHandler,
 } = {}) {
   const instances = new Map();
   const history = [];
@@ -83,7 +85,7 @@ export async function startVastMock({
       if (!offer) return json(res, 400, { success: false, error: 'invalid_args', msg: 'offer not found' });
       const id = nextId++;
       const inst = { id, offer, payload: data, keys: [], status: 'loading', intended: 'running', created: Date.now(), ssh: null };
-      inst.ssh = await startSshServer({ authorizedKeys: () => inst.keys, cwd: instanceCwd });
+      inst.ssh = await startSshServer({ authorizedKeys: () => inst.keys, cwd: instanceCwd, handler: execHandler });
       instances.set(id, inst);
       history.push(inst);
       setTimeout(() => {

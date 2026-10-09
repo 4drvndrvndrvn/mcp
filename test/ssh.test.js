@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHmac, randomBytes } from 'node:crypto';
 import ssh2 from 'ssh2';
-import { SshPool, OutputCollector, checkKnownHosts, cleanOutput, ensureKeyPair, shellQuote } from '../servers/lib/ssh.js';
+import { SshPool, OutputCollector, asUser, checkKnownHosts, cleanOutput, ensureKeyPair, shellQuote } from '../servers/lib/ssh.js';
 import { startSshServer } from './helpers/ssh-server.js';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-test-'));
@@ -116,4 +116,28 @@ test('OutputCollector keeps the head and tail of long output', () => {
 
 test('cleanOutput strips colors and progress-bar redraws', () => {
   assert.equal(cleanOutput('\x1b[32mgreen\x1b[0m\n10%\r50%\r100%\ndone'), 'green\n100%\ndone');
+});
+
+test('the test server can answer commands without running them', async () => {
+  const dry = await startSshServer({ authorizedKeys: () => [client.publicKey], handler: (cmd) => ({ stdout: `would run: ${cmd}\n`, code: 7 }) });
+  const p = new SshPool();
+  try {
+    const r = await p.exec({ ...target, port: dry.port }, 'rm -rf /nope', { hostKeys: off });
+    assert.equal(r.stdout, 'would run: rm -rf /nope\n');
+    assert.equal(r.code, 7);
+    assert.deepEqual(dry.commands, ['rm -rf /nope']);
+  } finally {
+    p.closeAll();
+    await dry.close();
+  }
+});
+
+test('asUser builds a valid command that creates the user and runs a login shell', async () => {
+  const cmd = asUser('user', "echo 'hi' && whoami");
+  assert.equal(cmd, `{ id -u user >/dev/null 2>&1 || useradd -m -s /bin/bash user; } && runuser -l user -c 'echo '\\''hi'\\'' && whoami'`);
+  // Syntax-check with the shell without running it.
+  const { execFileSync } = await import('node:child_process');
+  execFileSync('sh', ['-n', '-c', cmd]);
+  assert.throws(() => asUser('root; rm -rf /', 'x'), /Invalid username/);
+  assert.throws(() => asUser('root', 'x'), /normal user/);
 });

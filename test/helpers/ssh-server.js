@@ -9,8 +9,10 @@ const { Server, utils } = ssh2;
  * @param {object} opts
  * @param {() => string[]} opts.authorizedKeys  public key lines accepted for login (read on every attempt)
  * @param {string} [opts.cwd]  working directory for commands
+ * @param {(command: string) => {stdout?: string, stderr?: string, code?: number}} [opts.handler]
+ *   answer commands without running them (dry run)
  */
-export async function startSshServer({ authorizedKeys, cwd } = {}) {
+export async function startSshServer({ authorizedKeys, cwd, handler } = {}) {
   const hostKey = utils.generateKeyPairSync('ed25519');
   const commands = [];
   const clients = new Set();
@@ -33,6 +35,15 @@ export async function startSshServer({ authorizedKeys, cwd } = {}) {
           session.on('exec', (accept, _reject, info) => {
             commands.push(info.command);
             const stream = accept();
+            if (handler) {
+              const r = handler(info.command) || {};
+              stream.resume();
+              if (r.stdout) stream.write(r.stdout);
+              if (r.stderr) stream.stderr.write(r.stderr);
+              stream.exit(r.code ?? 0);
+              stream.end();
+              return;
+            }
             const child = spawn('sh', ['-c', info.command], { cwd });
             stream.pipe(child.stdin);
             child.stdout.on('data', (d) => stream.write(d));

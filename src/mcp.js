@@ -26,6 +26,20 @@ export function expandEnv(value) {
 const expandRecord = (record) =>
   Object.fromEntries(Object.entries(record || {}).map(([k, v]) => [k, expandEnv(String(v))]));
 
+// Network settings that servers need to reach the internet behind proxies or
+// TLS-inspecting firewalls. They are passed through when set; nothing else is.
+const NETWORK_ENV = [
+  'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'no_proxy', 'all_proxy',
+  'NODE_EXTRA_CA_CERTS', 'NODE_USE_ENV_PROXY', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE',
+];
+
+/** Environment for a stdio server: network settings from our environment plus its own `env` (expanded). */
+export function childEnv(configEnv, parentEnv = process.env) {
+  const out = {};
+  for (const key of NETWORK_ENV) if (parentEnv[key]) out[key] = parentEnv[key];
+  return { ...out, ...expandRecord(configEnv) };
+}
+
 /** Validates and normalizes one server entry from the config file or the UI. */
 export function normalizeServerConfig(cfg) {
   if (!cfg || typeof cfg !== 'object') throw new Error('Server config must be an object');
@@ -213,7 +227,7 @@ export class McpManager {
         args: (cfg.args || []).map(expandEnv),
         // The SDK merges this with a safe default environment (PATH, HOME, ...),
         // so secrets like NANOGPT_API_KEY are only passed on when referenced as ${VAR}.
-        env: expandRecord(cfg.env),
+        env: childEnv(cfg.env),
         cwd: cfg.cwd ? expandEnv(cfg.cwd) : ROOT_DIR,
         stderr: 'pipe',
       });

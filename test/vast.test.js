@@ -207,3 +207,31 @@ test('an auto-destroy deadline that passed while the app was down runs at startu
     await second.client.close();
   }
 });
+
+test('vast_exec run_as_user wraps the command for a normal user', async () => {
+  const dry = await startVastMock({ bootMs: 0, execHandler: (cmd) => (cmd === 'echo ready' ? { stdout: 'ready\n' } : { stdout: 'ok\n' }) });
+  const client = new Client({ name: 'test', version: '1' });
+  await client.connect(new StdioClientTransport({
+    command: process.execPath,
+    args: [path.join(ROOT, 'servers/vast.js')],
+    env: { VAST_API_URL: dry.url, VAST_API_KEY: 'test-key', VAST_SSH_KEY_PATH: path.join(tmp, 'vast_key'), VAST_AUTO_DESTROY_FILE: path.join(tmp, 'ad2.json'), VAST_POLL_MS: '50' },
+  }));
+  const call = async (name, args) => (await client.callTool({ name, arguments: args })).content[0].text;
+  try {
+    const id = Number((await call('vast_create_instance', { offer_id: 1001, image: 'ubuntu' })).match(/Created instance (\d+)/)[1]);
+    await call('vast_wait_for_instance', { instance_id: id, timeout_seconds: 20 });
+    const out = await call('vast_exec', { instance_id: id, command: 'bash install.sh', run_as_user: 'user' });
+    assert.match(out, /as user/);
+    assert.equal(dry.instances.get(id).ssh.commands.at(-1), "{ id -u user >/dev/null 2>&1 || useradd -m -s /bin/bash user; } && runuser -l user -c 'bash install.sh'");
+    const bad = await client.callTool({ name: 'vast_exec', arguments: { instance_id: id, command: 'x', run_as_user: 'Root;x' } });
+    assert.equal(bad.isError, true);
+    // "root" just runs as root, unwrapped.
+    const root = await call('vast_exec', { instance_id: id, command: 'whoami', run_as_user: 'root' });
+    assert.match(root, /as root/);
+    assert.equal(dry.instances.get(id).ssh.commands.at(-1), 'whoami');
+    await call('vast_destroy_instance', { instance_id: id });
+  } finally {
+    await client.close();
+    await dry.close();
+  }
+});
