@@ -148,7 +148,10 @@ export const publicKeyLine = (parsed, comment = '') =>
 export function ensureKeyPair(keyPath, comment) {
   if (!fs.existsSync(keyPath)) {
     fs.mkdirSync(path.dirname(keyPath), { recursive: true, mode: 0o700 });
-    const pair = utils.generateKeyPairSync('ed25519', { comment });
+    // ssh2 occasionally generates an ed25519 key it can't parse back, which would break every login.
+    let pair;
+    do pair = utils.generateKeyPairSync('ed25519', { comment });
+    while (utils.parseKey(pair.private) instanceof Error);
     fs.writeFileSync(keyPath, pair.private, { mode: 0o600 });
     fs.writeFileSync(`${keyPath}.pub`, `${pair.public}\n`, { mode: 0o644 });
   }

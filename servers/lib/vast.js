@@ -195,6 +195,8 @@ const ERROR_MESSAGE = /\berror\b|\bfailed\b|\bdenied\b/i;
 export function startupProblem(inst) {
   const status = instanceStatus(inst);
   if (status === 'running' || inst.intended_status === 'stopped') return null;
+  // Not given its machine yet: a restarted stopped instance or an outbid interruptible one waits for its GPU.
+  if (inst.cur_state === 'stopped') return null;
   const msg = String(inst.status_msg || '').trim();
   if (msg && ERROR_MESSAGE.test(msg)) return { kind: 'error', message: msg.slice(0, 500) };
   if (status === 'exited' || status === 'offline') {

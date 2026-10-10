@@ -23,6 +23,9 @@ async function connect(env) {
         VAST_SSH_KEY_PATH: path.join(tmp, 'vast_key'),
         VAST_AUTO_DESTROY_FILE: path.join(tmp, 'auto-destroy.json'),
         VAST_POLL_MS: '100',
+        // Don't let the developer's .env change the defaults under test.
+        VAST_AUTO_DESTROY_MINUTES: '',
+        VAST_MAX_PRICE_PER_HOUR: '',
         ...env,
       },
       stderr: 'pipe',
@@ -214,7 +217,7 @@ test('vast_exec run_as_user wraps the command for a normal user', async () => {
   await client.connect(new StdioClientTransport({
     command: process.execPath,
     args: [path.join(ROOT, 'servers/vast.js')],
-    env: { VAST_API_URL: dry.url, VAST_API_KEY: 'test-key', VAST_SSH_KEY_PATH: path.join(tmp, 'vast_key'), VAST_AUTO_DESTROY_FILE: path.join(tmp, 'ad2.json'), VAST_POLL_MS: '50' },
+    env: { VAST_API_URL: dry.url, VAST_API_KEY: 'test-key', VAST_SSH_KEY_PATH: path.join(tmp, 'vast_key'), VAST_AUTO_DESTROY_FILE: path.join(tmp, 'ad2.json'), VAST_POLL_MS: '50', VAST_AUTO_DESTROY_MINUTES: '', VAST_MAX_PRICE_PER_HOUR: '' },
   }));
   const call = async (name, args) => (await client.callTool({ name, arguments: args })).content[0].text;
   try {
@@ -278,6 +281,8 @@ test('startupProblem only reports instances that should be starting', () => {
   });
   assert.equal(startupProblem({ actual_status: 'offline', intended_status: 'running' }).kind, 'down');
   assert.equal(startupProblem({ actual_status: 'exited', intended_status: 'running', status_msg: 'Exited (0)' }).kind, 'down');
+  // Waiting for its GPU after a restart, or outbid: queued, not failed, even with a stale error message.
+  assert.equal(startupProblem({ actual_status: 'exited', intended_status: 'running', cur_state: 'stopped', status_msg: 'Error: old' }), null);
 });
 
 test('templates without SSH are refused unless allow_no_ssh is set', async () => {
@@ -385,7 +390,7 @@ test('an instance rented while the call was being cancelled is destroyed', async
   await client.connect(new StdioClientTransport({
     command: process.execPath,
     args: [path.join(ROOT, 'servers/vast.js')],
-    env: { VAST_API_URL: slow.url, VAST_API_KEY: 'test-key', VAST_SSH_KEY_PATH: path.join(tmp, 'vast_key'), VAST_AUTO_DESTROY_FILE: file, VAST_POLL_MS: '50' },
+    env: { VAST_API_URL: slow.url, VAST_API_KEY: 'test-key', VAST_SSH_KEY_PATH: path.join(tmp, 'vast_key'), VAST_AUTO_DESTROY_FILE: file, VAST_POLL_MS: '50', VAST_AUTO_DESTROY_MINUTES: '', VAST_MAX_PRICE_PER_HOUR: '' },
   }));
   try {
     const controller = new AbortController();
@@ -408,6 +413,40 @@ test('an auto-destroy deadline still runs when the schedule file cannot be writt
   try {
     const id = createdId(await call('vast_create_instance', { offer_id: 1001, image: 'ubuntu', auto_destroy_minutes: 0.01 }));
     await waitFor(() => !mock.instances.has(id));
+  } finally {
+    await client.close();
+  }
+});
+
+test('stopping warns that the auto-destroy deadline still deletes the data', async () => {
+  const { client, call } = await connect({ VAST_API_KEY: 'test-key', VAST_AUTO_DESTROY_FILE: path.join(tmp, 'stop.json') });
+  try {
+    const id = createdId(await call('vast_create_instance', { offer_id: 1001, image: 'ubuntu' }));
+    const stopped = await call('vast_stop_instance', { instance_id: id });
+    assert.match(stopped.text, /still be destroyed automatically, with its data, in 120 min; call vast_set_auto_destroy with minutes 0/);
+    await call('vast_set_auto_destroy', { instance_id: id, minutes: 0 });
+    const again = await call('vast_stop_instance', { instance_id: id });
+    assert.doesNotMatch(again.text, /destroyed automatically/);
+    await call('vast_destroy_instance', { instance_id: id });
+  } finally {
+    await client.close();
+  }
+});
+
+test('vast_set_auto_destroy reports a change it could not save and keeps the old deadline', async () => {
+  const file = path.join(tmp, 'unsaveable.json');
+  const { client, call } = await connect({ VAST_API_KEY: 'test-key', VAST_AUTO_DESTROY_FILE: file });
+  try {
+    const id = createdId(await call('vast_create_instance', { offer_id: 1001, image: 'ubuntu', auto_destroy_minutes: 60 }));
+    const before = readJson(file);
+    // A directory where the server writes its temp file makes every save fail.
+    fs.mkdirSync(`${file}.${client.transport.pid}.tmp`);
+    const r = await call('vast_set_auto_destroy', { instance_id: id, minutes: 0 });
+    assert.equal(r.isError, true);
+    assert.match(r.text, /Could not save the change .* previous auto-destroy deadline \(in 60 min\) still applies/);
+    assert.deepEqual(readJson(file), before);
+    assert.match((await call('vast_get_instance', { instance_id: id })).text, /auto-destroy in 60 min/);
+    await call('vast_destroy_instance', { instance_id: id });
   } finally {
     await client.close();
   }

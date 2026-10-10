@@ -13,7 +13,10 @@ const { Server, utils } = ssh2;
  *   answer commands without running them (dry run)
  */
 export async function startSshServer({ authorizedKeys, cwd, handler } = {}) {
-  const hostKey = utils.generateKeyPairSync('ed25519');
+  // ssh2 occasionally generates an ed25519 key it can't parse back; retry until it can.
+  let hostKey;
+  do hostKey = utils.generateKeyPairSync('ed25519');
+  while (utils.parseKey(hostKey.private) instanceof Error);
   const commands = [];
   const clients = new Set();
   const server = new Server({ hostKeys: [hostKey.private] }, (client) => {

@@ -108,7 +108,7 @@ function clearTimer(id) {
 function cancelAutoDestroy(id) {
   clearTimer(id);
   unsaved.delete(id);
-  editSchedule((data) => {
+  return editSchedule((data) => {
     delete data[id];
   });
 }
@@ -120,6 +120,7 @@ function scheduleAutoDestroy(id, at) {
   });
   if (saved) unsaved.delete(id);
   else unsaved.add(id);
+  return saved;
 }
 
 /** Picks up deadlines that other copies of this server set, moved or cancelled. */
@@ -217,8 +218,8 @@ async function requireInstance(id, signal) {
 const instanceId = z.number().int().positive().describe('Instance id (from vast_create_instance or vast_list_instances)');
 
 // How many checks in a row (POLL_MS apart, ~10 s) a startup problem must last before
-// vast_wait_for_instance gives up. An exited container gets longer: a stopped instance
-// that was just started still reads "exited" until its host starts it again.
+// vast_wait_for_instance gives up. An exited or offline container gets longer, since
+// it can be a restart or a host blip.
 const FAILED_CHECKS = { error: 3, down: 12 };
 
 const server = new McpServer({ name: 'vast', version: '1.0.0' });
@@ -640,11 +641,21 @@ server.registerTool(
   },
   safe(async ({ instance_id, minutes }, extra) => {
     await requireInstance(instance_id, extra.signal);
-    if (!minutes) {
-      cancelAutoDestroy(instance_id);
-      return text(`Auto-destroy cancelled for instance ${instance_id}. It keeps running (and billing) until destroyed.`);
+    const saved = minutes ? scheduleAutoDestroy(instance_id, Date.now() + minutes * 60_000) : cancelAutoDestroy(instance_id);
+    if (!saved) {
+      // Go back to the saved deadline rather than keep a change a restart or another copy would undo.
+      unsaved.delete(instance_id);
+      clearTimer(instance_id);
+      syncSchedule();
+      const entry = autoDestroy.get(instance_id);
+      const current = entry ? `in ${Math.max(0, Math.round((entry.at - Date.now()) / 60_000))} min` : 'none';
+      return text(
+        `Could not save the change to ${scheduleFile}, so the previous auto-destroy deadline (${current}) still applies. ` +
+          'Destroy or stop the instance yourself, or free the disk and try again.',
+        true,
+      );
     }
-    scheduleAutoDestroy(instance_id, Date.now() + minutes * 60_000);
+    if (!minutes) return text(`Auto-destroy cancelled for instance ${instance_id}. It keeps running (and billing) until destroyed.`);
     return text(`Instance ${instance_id} will be destroyed automatically in ${minutes} minutes.`);
   }),
 );
@@ -679,9 +690,17 @@ stateTool(
 stateTool(
   'vast_stop_instance',
   'Stop a Vast.ai instance',
-  'Stop an instance. GPU billing stops, but storage is still billed and the data is kept until it is destroyed.',
+  'Stop an instance. GPU billing stops, but storage is still billed and the data is kept until it is destroyed, ' +
+    'including by its auto-destroy deadline if it has one (cancel that with vast_set_auto_destroy minutes 0 to keep the data).',
   (id, o) => api.setState(id, 'stopped', o),
-  (id) => `Stopping instance ${id}. Storage is still billed until it is destroyed.`,
+  (id) => {
+    const entry = autoDestroy.get(id);
+    const deadline = entry
+      ? ` It will still be destroyed automatically, with its data, in ${Math.max(0, Math.round((entry.at - Date.now()) / 60_000))} min; ` +
+        'call vast_set_auto_destroy with minutes 0 to keep it.'
+      : '';
+    return `Stopping instance ${id}. Storage is still billed until it is destroyed.${deadline}`;
+  },
 );
 stateTool(
   'vast_reboot_instance',
