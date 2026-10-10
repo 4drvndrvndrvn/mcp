@@ -1,5 +1,6 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -233,5 +234,46 @@ test('vast_exec run_as_user wraps the command for a normal user', async () => {
   } finally {
     await client.close();
     await dry.close();
+  }
+});
+
+const hasX = ['Xvfb', 'xdotool', 'xclip', 'import'].every((bin) => spawnSync('sh', ['-c', `command -v ${bin}`]).status === 0);
+
+test('vast_screenshot and vast_desktop drive the desktop over SSH', { skip: !hasX && 'needs Xvfb, xdotool, xclip and ImageMagick' }, async () => {
+  const display = ':57';
+  const xvfb = spawn('Xvfb', [display, '-screen', '0', '1920x1080x24'], { stdio: 'ignore' });
+  const { client, call } = await connect({ VAST_API_KEY: 'test-key' });
+  try {
+    await waitFor(() => fs.existsSync('/tmp/.X11-unix/X57'));
+    const id = Number((await call('vast_create_instance', { offer_id: 1001, template_hash: DESKTOP_TEMPLATE.hash_id })).text.match(/Created instance (\d+)/)[1]);
+    await call('vast_wait_for_instance', { instance_id: id, timeout_seconds: 30 });
+
+    const shot = await client.callTool({ name: 'vast_screenshot', arguments: { instance_id: id, display } });
+    assert.equal(shot.isError, undefined, JSON.stringify(shot.content).slice(0, 500));
+    const image = shot.content.find((c) => c.type === 'image');
+    assert.equal(image.mimeType, 'image/png');
+    assert.equal(Buffer.from(image.data, 'base64').subarray(1, 4).toString(), 'PNG');
+    assert.match(shot.content.find((c) => c.type === 'text').text, /Screen 1920x1080, shown at 1280x720/);
+
+    const code = "local part = Instance.new('Part')\npart.Parent = workspace";
+    const acted = await client.callTool({
+      name: 'vast_desktop',
+      arguments: { instance_id: id, display, actions: [{ action: 'paste', text: code }, { action: 'drag', x: 10, y: 10, to_x: 100, to_y: 200 }], wait_ms: 0 },
+    });
+    assert.equal(acted.isError, undefined, JSON.stringify(acted.content).slice(0, 500));
+    assert.ok(acted.content.some((c) => c.type === 'image'));
+    const env = { ...process.env, DISPLAY: display };
+    // (Xvfb only moves the pointer after a first key event, hence paste before drag.)
+    // Coordinates are scaled from the 1280-wide screenshot to the 1920-wide screen.
+    assert.match(spawnSync('xdotool', ['getmouselocation'], { env, encoding: 'utf8' }).stdout, /x:150 y:300/);
+    assert.equal(spawnSync('xclip', ['-o', '-selection', 'clipboard'], { env, encoding: 'utf8' }).stdout, code);
+
+    const bad = await client.callTool({ name: 'vast_desktop', arguments: { instance_id: id, display, actions: [{ action: 'key', keys: 'ctrl+s; rm -rf /' }] } });
+    assert.equal(bad.isError, true);
+
+    await call('vast_destroy_instance', { instance_id: id });
+  } finally {
+    await client.close();
+    xvfb.kill();
   }
 });

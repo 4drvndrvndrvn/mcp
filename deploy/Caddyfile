@@ -1,0 +1,7 @@
+# HTTPS reverse proxy for the app. install.sh replaces DOMAIN with your domain.
+DOMAIN {
+	reverse_proxy 127.0.0.1:3000 {
+		# Stream tool progress and chat replies without buffering.
+		flush_interval -1
+	}
+}

@@ -359,6 +359,31 @@ export class McpManager {
     return { tools, lookup };
   }
 
+  /**
+   * Tools of the connected servers to offer over this app's own /mcp endpoint, as MCP tool
+   * definitions. Tools keep their own names unless that clashes with another tool or a
+   * `reserved` name, in which case they become `server__tool`.
+   * @param {string[] | null} serverNames  servers to include (null: all)
+   */
+  getExposedTools(serverNames = null, reserved = []) {
+    const entries = [];
+    for (const [server, entry] of this.servers) {
+      if (entry.status !== 'connected') continue;
+      if (serverNames && !serverNames.includes(server)) continue;
+      for (const tool of entry.tools) entries.push({ server, tool });
+    }
+    const counts = new Map();
+    for (const { tool } of entries) counts.set(tool.name, (counts.get(tool.name) || 0) + 1);
+    const taken = new Set(reserved);
+    return entries.map(({ server, tool }) => {
+      let name = sanitizeName(tool.name).slice(0, 64);
+      if (counts.get(tool.name) > 1 || taken.has(name)) name = `${sanitizeName(server)}__${sanitizeName(tool.name)}`.slice(0, 64);
+      for (let i = 2; taken.has(name); i++) name = `${name.slice(0, 60)}_${i}`;
+      taken.add(name);
+      return { server, tool: tool.name, definition: { ...tool, name, inputSchema: cleanSchema(tool.inputSchema) } };
+    });
+  }
+
   async callTool(server, tool, args, { signal, onProgress } = {}) {
     const entry = this.servers.get(server);
     if (!entry?.client) throw new Error(`MCP server "${server}" is not connected`);

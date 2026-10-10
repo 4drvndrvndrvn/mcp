@@ -5,7 +5,7 @@ A small Node.js server and web chat UI for the [NanoGPT API](https://nano-gpt.co
 - **Web chat**: streams replies, renders Markdown, shows reasoning, and lets you search and filter models by tool support, vision and price. Chats are saved in your browser, and each reply shows its cost.
 - **MCP tools**: connect stdio, Streamable HTTP or SSE MCP servers from the UI or a config file. Their tools are passed to the model, which can call them over several rounds. Each call shows up as a card with its arguments, live progress and result. Tools that can change things wait for you to click **Run**.
 - **Built-in Vast.ai, SSH and web search tools**: the model can rent a GPU machine on [Vast.ai](https://vast.ai), run commands on it and destroy it, run commands on any server over SSH, and look things up on the web instead of guessing.
-- **MCP server**: the app is also an MCP server at `/mcp`, so Claude Code, Claude Desktop, Cursor and other MCP clients can send prompts through NanoGPT models.
+- **MCP server for Claude**: the app is also an MCP server at `/mcp`. Deployed on a VPS, it gives Claude (the Claude app, claude.ai, Claude Code) the Vast.ai, SSH and web search tools, including screenshots and mouse/keyboard control of a rented desktop, so you can say *"rent a desktop on Vast, install Roblox Studio and write me a script"*. See [Use it from Claude on a VPS](#use-it-from-claude-on-a-vps).
 
 ## Quick start
 
@@ -29,6 +29,30 @@ On the first start the app creates `mcp-servers.json` from `mcp-servers.example.
 | `web` (`servers/web.js`) | `web_search`: answers with sources from a NanoGPT `:online` model (a few cents per search) |
 
 Try asking *"What time is it in Tokyo?"*. Servers added to the example in a later version are added to your `mcp-servers.json` once on startup; if you remove one, it stays removed.
+
+## Use it from Claude on a VPS
+
+On an Ubuntu or Debian VPS (1 vCPU and 1 GB RAM is enough):
+
+```bash
+git clone https://github.com/4drvndrvndrvn/mcp.git && cd mcp
+sudo bash deploy/install.sh                     # or: sudo bash deploy/install.sh chat.yourdomain.com
+```
+
+The script asks for your Vast.ai API key and installs Node.js, the app (in `/opt/nanochat/app`, run by a `nanochat` user), a systemd service and [Caddy](https://caddyserver.com) for HTTPS. Without a domain it uses `<your-ip>.sslip.io`, which needs no DNS setup and still gets a real certificate. Ports 80 and 443 must be open. At the end it prints your connection details:
+
+- **Claude app / claude.ai:** *Settings → Connectors → Add custom connector*, and paste the URL `https://<domain>/mcp/<ACCESS_TOKEN>`. The token in the URL is the password (connectors can't send a token header), so keep the URL private.
+- **Claude Code:** `claude mcp add --transport http vps https://<domain>/mcp --header "Authorization: Bearer <ACCESS_TOKEN>"`
+
+To update, run `git pull && sudo bash deploy/install.sh` again: `.env`, `mcp-servers.json` and `.data/` are kept. Settings live in `/opt/nanochat/app/.env` (`sudo systemctl restart nanochat` after a change) and logs go to `journalctl -u nanochat -f`. Claude asks you before each tool that changes something, such as renting, running a command or clicking.
+
+Then ask Claude, for example:
+
+> Rent a cheap Vast.ai desktop, install Roblox Studio with TuxBlox and open it. I'll sign in, then write a script that makes a part change color when touched.
+
+Claude finds the *Linux Desktop* template, rents a machine with an auto-destroy deadline, installs TuxBlox with `vast_exec`, launches Studio, and watches the screen with `vast_screenshot`. When Studio asks you to sign in, Claude stops and asks you to do it yourself: open the desktop in your browser from the instance's **Open** button at https://cloud.vast.ai/instances/. Claude never needs your Roblox password. After that it creates the script with `vast_desktop`, pasting code into the editor instead of typing it, and destroys the machine when you say you're done.
+
+Roblox Studio through TuxBlox only runs on hosts with Linux kernel 6.7 or newer and a working Vulkan driver, so Claude may need to try another machine. See [Vast.ai](#vastai).
 
 ## Approving tool calls
 
@@ -69,6 +93,8 @@ About TuxBlox itself: it's a new, small project whose installer is an unsigned b
 | `vast_create_instance` | Rents a machine with a template or Docker image. Billing starts here. |
 | `vast_wait_for_instance` | Waits until the machine is running and accepts SSH, reporting progress while the image downloads. |
 | `vast_exec` | Runs a shell command on the machine, as root or, with `run_as_user`, as a normal user (created if missing) for installers that refuse root. |
+| `vast_screenshot` | Takes a screenshot of the instance's desktop (desktop templates). |
+| `vast_desktop` | Clicks, drags, scrolls, types, pastes, presses keys and launches apps on the desktop, then returns a screenshot. Coordinates are in the screenshot's pixels. |
 | `vast_instance_logs` | Shows the container log. |
 | `vast_list_instances`, `vast_get_instance`, `vast_account` | Status, SSH address, price and remaining credit. |
 | `vast_start_instance`, `vast_stop_instance`, `vast_reboot_instance`, `vast_destroy_instance` | Lifecycle. Destroying deletes the machine and its data and stops billing. |
@@ -76,6 +102,7 @@ About TuxBlox itself: it's a new, small project whose installer is an unsigned b
 
 - The server creates its own SSH key (`.data/vast_ed25519`) and attaches it to each instance it creates, so `vast_exec` works without any SSH setup.
 - **Safety nets:** `auto_destroy_minutes` on `vast_create_instance` (or `VAST_AUTO_DESTROY_MINUTES` for all instances) destroys a machine even if the model never gets to it. Deadlines are saved in `.data/`, so one that passed while the app was off runs on the next start. `VAST_MAX_PRICE_PER_HOUR` refuses offers above that price.
+- The desktop tools find the X display the desktop session uses and install `xdotool`, `xclip` and ImageMagick on the instance the first time. Apps started with the `launch` action run as the desktop's user, in its session. Screenshots are scaled to `VAST_SCREENSHOT_WIDTH` (1280) pixels wide.
 - With a template, the template's own startup script is kept. Run your commands with `vast_exec` after `vast_wait_for_instance`.
 
 ## SSH
@@ -121,7 +148,7 @@ Click **MCP servers** in the sidebar to add, reconnect, disable or remove server
 
 ## Using it as an MCP server
 
-`POST /mcp` is a stateless Streamable HTTP MCP endpoint with two tools:
+`POST /mcp` is a stateless Streamable HTTP MCP endpoint. It offers the tools of every connected MCP server under their own names (`vast_create_instance`, `ssh_exec`, `web_search`, …; `server__tool` if two servers share a name), or only those of the servers listed in `EXPOSE_MCP_SERVERS`. Progress from long tools, such as `vast_wait_for_instance`, is streamed to the client. Its MCP instructions tell the client how to use a rented desktop. With a NanoGPT key it also offers:
 
 | Tool | What it does |
 | --- | --- |
@@ -136,6 +163,8 @@ claude mcp add --transport http nanogpt http://localhost:3000/mcp
 claude mcp add --transport http nanogpt http://localhost:3000/mcp --header "Authorization: Bearer <token>"
 ```
 
+When `ACCESS_TOKEN` is set, `/mcp/<ACCESS_TOKEN>` works without a header, for clients such as claude.ai connectors that can't send one.
+
 Clients that only support stdio can use [`mcp-remote`](https://www.npmjs.com/package/mcp-remote):
 
 ```json
@@ -146,11 +175,13 @@ Clients that only support stdio can use [`mcp-remote`](https://www.npmjs.com/pac
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `NANOGPT_API_KEY` | — | **Required.** Your NanoGPT API key. |
+| `NANOGPT_API_KEY` | — | Your NanoGPT API key. Needed for the web chat, `web_search` and the `chat` tool. Without it, `/mcp` still offers the other tools. |
 | `DEFAULT_MODEL` | `openai/gpt-5.4-mini` | The model selected in a new browser. |
 | `HOST` | `127.0.0.1` | Interface to listen on. |
 | `PORT` | `3000` | Port to listen on. |
-| `ACCESS_TOKEN` | — | If set, the API and `/mcp` require `Authorization: Bearer <token>`. The UI asks for it once. |
+| `ACCESS_TOKEN` | — | If set, the API and `/mcp` require `Authorization: Bearer <token>`, and `/mcp/<token>` works without the header. The UI asks for it once. |
+| `ALLOWED_HOSTS` | — | Extra hostnames accepted while `HOST` is local, e.g. the domain your reverse proxy forwards (`chat.example.com`). |
+| `EXPOSE_MCP_SERVERS` | all | Comma-separated MCP servers whose tools `/mcp` offers, e.g. `vast,ssh,web` (`none` for only `chat`/`list_models`). |
 | `MAX_TOOL_ROUNDS` | `20` | Rounds of tool calls in one reply, before the 3 clean-up rounds. |
 | `MCP_CONFIG` | `./mcp-servers.json` | Path to the MCP servers file. |
 | `NANOGPT_BASE_URL` | `https://nano-gpt.com/api/v1` | API base URL. |
@@ -163,13 +194,14 @@ Clients that only support stdio can use [`mcp-remote`](https://www.npmjs.com/pac
 | `SSH_ALLOWED_HOSTS` | any | Comma-separated hostname patterns the model may connect to. |
 | `SSH_DEFAULT_USER` | `root` | User when none is given. |
 | `SSH_STRICT_HOST_KEY_CHECKING` | — | `yes` refuses hosts that aren't in known_hosts. |
+| `VAST_SCREENSHOT_WIDTH` | `1280` | Desktop screenshots wider than this are scaled down. |
 | `WEB_SEARCH_MODEL` | `openai/gpt-5.4-mini:online` | Model used by `web_search` (any NanoGPT model id with `:online`). |
 
 The bundled servers read their settings from `.env` themselves.
 
 ## Security
 
-- By default the server listens only on `127.0.0.1` and rejects requests whose `Host` header isn't `localhost`, `127.0.0.1` or `[::1]`, which blocks DNS-rebinding attacks.
+- By default the server listens only on `127.0.0.1` and rejects requests whose `Host` header isn't `localhost`, `127.0.0.1`, `[::1]` or in `ALLOWED_HOSTS`, which blocks DNS-rebinding attacks. Behind a reverse proxy, put your domain in `ALLOWED_HOSTS`.
 - **Set `ACCESS_TOKEN` before using `HOST=0.0.0.0`.** Anyone who can reach the port can spend your NanoGPT credits. A stdio MCP server runs a command on the host, so without a token the UI can't add stdio servers when the host is public.
 - MCP tools run with your permissions. Only connect servers you trust, and keep **Ask first** on unless you trust the model with what the tools can do: `ssh_exec` and `vast_exec` run arbitrary commands, and `vast_create_instance` spends money.
 - `.env`, `mcp-servers.json`, `ssh-hosts.json` and `.data/` (the Vast SSH key) are git-ignored because they hold secrets.
@@ -207,7 +239,8 @@ public/                Web UI (no build step)
 servers/vast.js        Vast.ai MCP server
 servers/ssh.js         SSH MCP server
 servers/web.js         Web search MCP server
-servers/lib/           Vast.ai API client, SSH connection pool
+servers/lib/           Vast.ai API client, SSH connection pool, desktop control scripts
+deploy/                VPS installer, systemd unit and Caddyfile
 examples/              Demo stdio MCP server
 test/helpers/          Throwaway SSH server and a mock Vast.ai API used by the tests
 ```

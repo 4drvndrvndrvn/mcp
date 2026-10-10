@@ -8,8 +8,7 @@ import { runAgent } from './src/agent.js';
 import { mcpEndpoint } from './src/mcp-endpoint.js';
 
 if (!config.apiKey) {
-  console.error('NANOGPT_API_KEY is not set. Copy .env.example to .env and add your key.');
-  process.exit(1);
+  console.warn('NANOGPT_API_KEY is not set: the web chat and the chat/list_models MCP tools are off. Add it to .env to use them.');
 }
 
 const nano = new NanoGPT({ apiKey: config.apiKey, baseUrl: config.baseUrl });
@@ -24,7 +23,7 @@ app.disable('x-powered-by');
 
 // Reject DNS-rebinding attempts against a localhost-only server.
 if (loopback) {
-  const allowed = new Set(['localhost', '127.0.0.1', '[::1]']);
+  const allowed = new Set(['localhost', '127.0.0.1', '[::1]', ...config.allowedHosts]);
   app.use((req, res, next) => {
     const host = (req.headers.host || '').replace(/:\d+$/, '').toLowerCase();
     if (!allowed.has(host)) return res.status(403).json({ error: 'Forbidden host' });
@@ -179,14 +178,25 @@ app.post('/api/chat', async (req, res) => {
 
 // ---- MCP server endpoint ---------------------------------------------------
 
-app.post('/mcp', requireAuth, mcpEndpoint({ nano, mcp, config }));
-app.all('/mcp', requireAuth, (req, res) => {
+const handleMcp = mcpEndpoint({ nano, mcp, config });
+const mcpMethodNotAllowed = (req, res) => {
   res.status(405).set('Allow', 'POST').json({
     jsonrpc: '2.0',
     error: { code: -32000, message: 'Method not allowed (stateless server: use POST)' },
     id: null,
   });
-});
+};
+app.post('/mcp', requireAuth, handleMcp);
+app.all('/mcp', requireAuth, mcpMethodNotAllowed);
+
+// /mcp/<ACCESS_TOKEN> is for clients that can't send an Authorization header, such as
+// custom connectors on claude.ai: the secret URL is the credential.
+const requirePathToken = (req, res, next) => {
+  if (config.accessToken && tokenMatches(req.params.token)) return next();
+  res.status(404).json({ error: 'Not found' });
+};
+app.post('/mcp/:token', requirePathToken, handleMcp);
+app.all('/mcp/:token', requirePathToken, mcpMethodNotAllowed);
 
 app.use((err, req, res, next) => {
   console.error(err);
@@ -202,6 +212,7 @@ const server = app.listen(config.port, config.host, () => {
   const shownHost = config.host.includes(':') ? `[${config.host}]` : config.host;
   console.log(`NanoGPT MCP chat running at http://${shownHost}:${config.port}`);
   console.log(`MCP endpoint: http://${shownHost}:${config.port}/mcp`);
+  if (config.accessToken) console.log('MCP endpoint for clients without headers (claude.ai connectors): /mcp/<ACCESS_TOKEN>');
   if (!loopback && !config.accessToken) {
     console.warn('WARNING: listening on a public interface without ACCESS_TOKEN. Anyone who can reach this port can use your NanoGPT credits.');
   }

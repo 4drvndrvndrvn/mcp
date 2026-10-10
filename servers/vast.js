@@ -15,6 +15,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { ROOT_DIR, loadEnv, progressReporter, safe, sleep, text } from './lib/common.js';
 import { SshPool, asUser, ensureKeyPair, formatExecResult } from './lib/ssh.js';
+import { DESKTOP_ACTIONS, SCREENSHOT_MAX_WIDTH, desktopScript, parseScreenshot, shownSize } from './lib/desktop.js';
 import {
   VastAPI,
   VAST_DEFAULT_URL,
@@ -121,7 +122,7 @@ function closeConnections(id) {
 const sshTarget = (endpoint) => ({ host: endpoint.host, port: endpoint.port, username: 'root', privateKey: sshKey().privateKey });
 
 /** Runs a command on the first reachable SSH endpoint of an instance. */
-async function execOnInstance(inst, command, { timeoutMs, signal, onProgress }) {
+async function execOnInstance(inst, command, { timeoutMs, signal, onProgress, stdoutLimit }) {
   const endpoints = sshEndpoints(inst);
   if (!endpoints.length) throw new Error(`Instance ${inst.id} has no SSH address yet. Call vast_wait_for_instance first.`);
   const errors = [];
@@ -129,7 +130,7 @@ async function execOnInstance(inst, command, { timeoutMs, signal, onProgress }) 
     try {
       // Instances are short-lived and reuse host:port pairs, so known_hosts can't be trusted for them.
       const target = sshTarget(endpoint);
-      const result = await pool.exec(target, command, { timeoutMs, signal, onProgress, hostKeys: { mode: 'off' } });
+      const result = await pool.exec(target, command, { timeoutMs, signal, onProgress, stdoutLimit, hostKeys: { mode: 'off' } });
       if (!connectionsByInstance.has(inst.id)) connectionsByInstance.set(inst.id, new Set());
       connectionsByInstance.get(inst.id).add(pool.keyFor(target));
       return { endpoint, result };
@@ -495,6 +496,102 @@ server.registerTool(
     const where = `instance ${instance_id} via ${endpoint.kind} ssh, as ${asOther ? run_as_user : 'root'}`;
     return text(formatExecResult(where, command, result, timeoutMs), result.timedOut);
   }),
+);
+
+// ---- Desktop: screenshots, mouse and keyboard ---------------------------------
+
+const screenshotWidth = Number(process.env.VAST_SCREENSHOT_WIDTH) || SCREENSHOT_MAX_WIDTH;
+const displayArg = z
+  .string()
+  .regex(/^[A-Za-z0-9.:_-]+$/)
+  .optional()
+  .describe('X display such as ":0" (default: the one the desktop session uses)');
+
+/** Runs a desktop script on a running instance and returns the MCP result (screenshot as an image). */
+async function runDesktop(instance_id, opts, extra, summary) {
+  const inst = await requireInstance(instance_id, extra.signal);
+  if (instanceStatus(inst) !== 'running') {
+    return text(`Instance ${instance_id} is ${instanceStatus(inst)}, not running. Call vast_wait_for_instance first.`, true);
+  }
+  await attachKey(instance_id, extra.signal);
+  const script = desktopScript({ ...opts, maxWidth: screenshotWidth });
+  // The first call may install xdotool, xclip and ImageMagick.
+  const { result } = await execOnInstance(inst, script, {
+    timeoutMs: 240_000,
+    signal: extra.signal,
+    onProgress: progressReporter(extra),
+    stdoutLimit: 30_000_000,
+  });
+  const notes = result.stderr.split('\n').filter((l) => l.trim() && !/^launched as /.test(l)).join('\n').trim();
+  if (result.code !== 0 || result.timedOut) {
+    return text(`${summary} failed${result.timedOut ? ' (timed out)' : ` (exit code ${result.code})`}.\n${notes || result.stdout.slice(-2000)}`, true);
+  }
+  const launched = result.stderr.match(/^launched as (.+)$/m)?.[1];
+  const lines = [summary + (launched ? ` (started as user ${launched}; output goes to /tmp/desktop-launch-${launched}.log)` : '') + '.'];
+  const shot = parseScreenshot(result.stdout);
+  if (!shot?.png) return text(lines.join('\n'));
+  const shown = shownSize(shot.screen, screenshotWidth);
+  lines.push(
+    `Screen ${shot.screen.width}x${shot.screen.height}` +
+      (shown.width !== shot.screen.width ? `, shown at ${shown.width}x${shown.height}` : '') +
+      '. Give vast_desktop coordinates in the pixels of this screenshot.',
+  );
+  return { content: [{ type: 'image', data: shot.png, mimeType: 'image/png' }, { type: 'text', text: lines.join('\n') }] };
+}
+
+server.registerTool(
+  'vast_screenshot',
+  {
+    title: 'Screenshot a Vast.ai desktop',
+    description:
+      "Take a screenshot of an instance's graphical desktop (instances rented with a desktop template, e.g. \"Linux Desktop\"). " +
+      'Use it to see what is on screen, then act with vast_desktop. Installs xdotool, xclip and ImageMagick on the first call.',
+    inputSchema: { instance_id: instanceId, display: displayArg },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  },
+  safe(async ({ instance_id, display }, extra) => runDesktop(instance_id, { display }, extra, 'Screenshot taken')),
+);
+
+const desktopAction = z.object({
+  action: z.enum(DESKTOP_ACTIONS).describe(
+    'click / double_click / right_click / middle_click (at x,y, or where the mouse is), move (to x,y), drag (x,y to to_x,to_y), ' +
+      'scroll (direction, amount, at x,y), type (text, typed key by key), paste (text via the clipboard: use it for code and long text), ' +
+      'key (keys, e.g. "Return", "ctrl+s", "ctrl+a BackSpace", "F5"), wait (seconds), ' +
+      'launch (command: start a GUI app in the background as the desktop user)',
+  ),
+  x: z.number().optional().describe('X in screenshot pixels'),
+  y: z.number().optional().describe('Y in screenshot pixels'),
+  to_x: z.number().optional().describe('drag: end X'),
+  to_y: z.number().optional().describe('drag: end Y'),
+  text: z.string().optional().describe('type / paste: the text'),
+  keys: z.string().optional().describe('key: xdotool key names, combos joined with +, several separated by spaces'),
+  direction: z.enum(['up', 'down', 'left', 'right']).optional().describe('scroll direction (default down)'),
+  amount: z.number().int().min(1).max(50).optional().describe('scroll: number of wheel clicks (default 3)'),
+  seconds: z.number().min(0).max(60).optional().describe('wait: seconds'),
+  command: z.string().optional().describe('launch: shell command, e.g. "firefox https://example.com"'),
+});
+
+server.registerTool(
+  'vast_desktop',
+  {
+    title: 'Use a Vast.ai desktop',
+    description:
+      "Control an instance's graphical desktop like a person would: click, drag, scroll, type, paste, press keys and launch apps. " +
+      'Runs the actions in order, then returns a screenshot so you can see the result. Take a vast_screenshot first and ' +
+      'give coordinates in its pixels. To write code into an editor (e.g. a Roblox Studio script), click into the editor, ' +
+      'select all with key "ctrl+a" and use paste: typing code key by key triggers auto-indent and auto-complete.',
+    inputSchema: {
+      instance_id: instanceId,
+      actions: z.array(desktopAction).min(1).max(30).describe('Actions to run in order'),
+      screenshot: z.boolean().optional().describe('Return a screenshot afterwards (default true)'),
+      wait_ms: z.number().int().min(0).max(30_000).optional().describe('Wait this long before the screenshot so the app can react (default 800)'),
+      display: displayArg,
+    },
+    annotations: { destructiveHint: true, openWorldHint: true },
+  },
+  safe(async ({ instance_id, actions, screenshot = true, wait_ms = 800, display }, extra) =>
+    runDesktop(instance_id, { actions, screenshot, waitMs: wait_ms, display }, extra, `Ran ${actions.map((a) => a.action).join(', ')}`),
+  ),
 );
 
 server.registerTool(

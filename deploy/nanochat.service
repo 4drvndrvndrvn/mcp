@@ -1,0 +1,16 @@
+[Unit]
+Description=NanoGPT MCP Chat (MCP server for Claude: Vast.ai, SSH, web search)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=nanochat
+WorkingDirectory=/opt/nanochat/app
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

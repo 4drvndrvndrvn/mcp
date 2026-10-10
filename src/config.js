@@ -14,6 +14,14 @@ const num = (value, fallback) => {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 };
 
+const list = (value) => String(value || '').split(',').map((s) => s.trim()).filter(Boolean);
+
+function exposeList(value) {
+  const names = list(value);
+  if (!names.length || names.includes('*') || names.includes('all')) return null;
+  return names.includes('none') ? [] : names;
+}
+
 export const config = {
   apiKey: process.env.NANOGPT_API_KEY || '',
   baseUrl: (process.env.NANOGPT_BASE_URL || 'https://nano-gpt.com/api/v1').replace(/\/+$/, ''),
@@ -23,6 +31,10 @@ export const config = {
   accessToken: process.env.ACCESS_TOKEN || '',
   mcpConfigPath: path.resolve(ROOT_DIR, process.env.MCP_CONFIG || 'mcp-servers.json'),
   maxToolRounds: num(process.env.MAX_TOOL_ROUNDS, 20),
+  // Extra hostnames accepted while HOST is loopback, e.g. the domain a reverse proxy forwards.
+  allowedHosts: list(process.env.ALLOWED_HOSTS).map((h) => h.toLowerCase()),
+  // MCP servers whose tools /mcp offers; null means all of them.
+  exposeServers: exposeList(process.env.EXPOSE_MCP_SERVERS),
 };
 
 export function isLoopbackHost(host) {

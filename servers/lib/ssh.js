@@ -277,13 +277,14 @@ export class SshPool {
    * Runs a command. Resolves with { code, signal, stdout, stderr, timedOut }; rejects only
    * if the command could not be started (connection or auth failure).
    */
-  async exec(target, command, { timeoutMs = 120_000, stdin, signal, onProgress, hostKeys } = {}) {
+  async exec(target, command, { timeoutMs = 120_000, stdin, signal, onProgress, hostKeys, stdoutLimit } = {}) {
     const conn = await this.connect(target, hostKeys);
     const key = this.keyFor(target);
     return new Promise((resolve, reject) => {
       conn.exec(command, (err, stream) => {
         if (err) return reject(err);
-        const stdout = new OutputCollector();
+        // stdoutLimit keeps up to that many bytes whole (e.g. a base64 screenshot) instead of head + tail.
+        const stdout = stdoutLimit ? new OutputCollector(stdoutLimit, 0) : new OutputCollector();
         const stderr = new OutputCollector();
         let code = null;
         let exitSignal = null;
