@@ -261,6 +261,7 @@ test('vast_wait_for_instance gives up on a container that keeps exiting', async 
     const r = await call('vast_wait_for_instance', { instance_id: id, timeout_seconds: 60 });
     assert.equal(r.isError, true);
     assert.match(r.text, /failed to start: the instance is exited \(Exited \(1\)/);
+    assert.match(r.text, /may still come up/, 'an exited instance is not called hopeless');
     await call('vast_destroy_instance', { instance_id: id });
   } finally {
     await client.close();
@@ -397,5 +398,17 @@ test('an instance rented while the call was being cancelled is destroyed', async
   } finally {
     await client.close();
     await slow.close();
+  }
+});
+
+test('an auto-destroy deadline still runs when the schedule file cannot be written', async () => {
+  const blocker = path.join(tmp, 'not-a-dir');
+  fs.writeFileSync(blocker, '');
+  const { client, call } = await connect({ VAST_API_KEY: 'test-key', VAST_AUTO_DESTROY_FILE: path.join(blocker, 'schedule.json') });
+  try {
+    const id = createdId(await call('vast_create_instance', { offer_id: 1001, image: 'ubuntu', auto_destroy_minutes: 0.01 }));
+    await waitFor(() => !mock.instances.has(id));
+  } finally {
+    await client.close();
   }
 });

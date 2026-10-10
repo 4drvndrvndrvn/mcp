@@ -62,6 +62,8 @@ function parseDefaultAutoDestroy(raw) {
 const defaultAutoDestroy = parseDefaultAutoDestroy(process.env.VAST_AUTO_DESTROY_MINUTES);
 const scheduleFile = path.resolve(ROOT_DIR, process.env.VAST_AUTO_DESTROY_FILE || '.data/vast-auto-destroy.json');
 const autoDestroy = new Map(); // instance id -> { at, timer }
+// Deadlines that could not be saved: the local timer is the only copy, so the file must not override it.
+const unsaved = new Set();
 
 /** The saved deadlines, { instanceId: epochMs }. */
 function readSchedule() {
@@ -75,7 +77,7 @@ function readSchedule() {
   return Object.fromEntries(Object.entries(data).filter(([, at]) => typeof at === 'number' && Number.isFinite(at)));
 }
 
-/** Applies one change to the saved deadlines, keeping the ones other copies of this server wrote. */
+/** Applies one change to the saved deadlines, keeping the ones other copies of this server wrote. Returns false if it failed. */
 function editSchedule(change) {
   try {
     const data = readSchedule();
@@ -85,8 +87,10 @@ function editSchedule(change) {
     const tmpFile = `${scheduleFile}.${process.pid}.tmp`;
     fs.writeFileSync(tmpFile, `${JSON.stringify(data, null, 2)}\n`);
     fs.renameSync(tmpFile, scheduleFile);
+    return true;
   } catch (err) {
     console.error(`[vast] could not save ${scheduleFile}: ${err.message}`);
+    return false;
   }
 }
 
@@ -103,6 +107,7 @@ function clearTimer(id) {
 
 function cancelAutoDestroy(id) {
   clearTimer(id);
+  unsaved.delete(id);
   editSchedule((data) => {
     delete data[id];
   });
@@ -110,26 +115,30 @@ function cancelAutoDestroy(id) {
 
 function scheduleAutoDestroy(id, at) {
   setTimer(id, at);
-  editSchedule((data) => {
+  const saved = editSchedule((data) => {
     data[id] = at;
   });
+  if (saved) unsaved.delete(id);
+  else unsaved.add(id);
 }
 
 /** Picks up deadlines that other copies of this server set, moved or cancelled. */
 function syncSchedule() {
   const saved = readSchedule();
-  for (const id of autoDestroy.keys()) if (!(id in saved)) clearTimer(id);
+  for (const id of autoDestroy.keys()) if (!(id in saved) && !unsaved.has(id)) clearTimer(id);
   for (const [key, at] of Object.entries(saved)) {
     const id = Number(key);
-    if (autoDestroy.get(id)?.at !== at) setTimer(id, at);
+    if (!unsaved.has(id) && autoDestroy.get(id)?.at !== at) setTimer(id, at);
   }
 }
 
 async function runAutoDestroy(id) {
   // Another copy of this server may have cancelled or moved the deadline.
-  const at = readSchedule()[id];
-  if (at === undefined) return clearTimer(id);
-  if (at > Date.now()) return setTimer(id, at);
+  if (!unsaved.has(id)) {
+    const at = readSchedule()[id];
+    if (at === undefined) return clearTimer(id);
+    if (at > Date.now()) return setTimer(id, at);
+  }
   try {
     await api.destroy(id);
     console.error(`[vast] auto-destroyed instance ${id}`);
@@ -517,12 +526,13 @@ server.registerTool(
       const problem = startupProblem(inst);
       failure = problem ? { kind: problem.kind, checks: problem.kind === failure.kind ? failure.checks + 1 : 1 } : { kind: null, checks: 0 };
       if (problem && failure.checks >= FAILED_CHECKS[problem.kind]) {
-        return text(
-          `Instance ${instance_id} failed to start: ${problem.message}\n${describe(inst)}\n` +
-            'It is still billed: check vast_instance_logs if you need to know more, then destroy it with vast_destroy_instance ' +
-            'and try another offer or image.',
-          true,
-        );
+        const advice =
+          problem.kind === 'error'
+            ? 'It is still billed: check vast_instance_logs if you need to know more, then destroy it with vast_destroy_instance ' +
+              'and try another offer or image.'
+            : 'A stopped instance that was just started waits until its GPU is free, so it may still come up: wait again, ' +
+              "check vast_instance_logs, or destroy it with vast_destroy_instance if you don't need its data.";
+        return text(`Instance ${instance_id} failed to start: ${problem.message}\n${describe(inst)}\n${advice}`, true);
       }
       if (status === 'running') {
         if (!check_ssh) return text(`Instance ${instance_id} is running.\n${describe(inst)}`);
