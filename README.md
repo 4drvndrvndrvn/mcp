@@ -66,8 +66,8 @@ About TuxBlox itself: it's a new, small project whose installer is an unsigned b
 | --- | --- |
 | `vast_search_templates` | Finds ready-made images (desktop, PyTorch, ComfyUI, Ollama…). Only Vast.ai's recommended templates unless `include_community` is set. |
 | `vast_search_offers` | Finds machines by GPU, VRAM, price, reliability, country… With `template_hash`, only machines that can run that template. |
-| `vast_create_instance` | Rents a machine with a template or Docker image. Billing starts here. |
-| `vast_wait_for_instance` | Waits until the machine is running and accepts SSH, reporting progress while the image downloads. |
+| `vast_create_instance` | Rents a machine with a template or Docker image. Billing starts here. Templates without SSH are refused unless `allow_no_ssh` is set, since `vast_exec` can't reach them. |
+| `vast_wait_for_instance` | Waits until the machine is running and accepts SSH, reporting progress while the image downloads. Stops early with Vast.ai's error if the image can't be pulled or the container keeps exiting. |
 | `vast_exec` | Runs a shell command on the machine, as root or, with `run_as_user`, as a normal user (created if missing) for installers that refuse root. |
 | `vast_instance_logs` | Shows the container log. |
 | `vast_list_instances`, `vast_get_instance`, `vast_account` | Status, SSH address, price and remaining credit. |
@@ -75,7 +75,7 @@ About TuxBlox itself: it's a new, small project whose installer is an unsigned b
 | `vast_set_auto_destroy` | Changes or cancels an instance's auto-destroy deadline. |
 
 - The server creates its own SSH key (`.data/vast_ed25519`) and attaches it to each instance it creates, so `vast_exec` works without any SSH setup.
-- **Safety nets:** `auto_destroy_minutes` on `vast_create_instance` (or `VAST_AUTO_DESTROY_MINUTES` for all instances) destroys a machine even if the model never gets to it. Deadlines are saved in `.data/`, so one that passed while the app was off runs on the next start. `VAST_MAX_PRICE_PER_HOUR` refuses offers above that price.
+- **Safety nets:** every instance created here is destroyed automatically after `VAST_AUTO_DESTROY_MINUTES` (default 120), even if the model never gets to it. The model can pick another deadline with `auto_destroy_minutes` (0 means never) or change it later with `vast_set_auto_destroy`; set `VAST_AUTO_DESTROY_MINUTES=0` to turn the default off. Deadlines are saved in `.data/`, so one that passed while the app was off runs on the next start, and other copies of the server (say, one you added to Claude Code) share them. If you cancel a reply while a machine is being rented, that machine is destroyed straight away. `VAST_MAX_PRICE_PER_HOUR` refuses offers above that price.
 - With a template, the template's own startup script is kept. Run your commands with `vast_exec` after `vast_wait_for_instance`.
 
 ## SSH
@@ -156,7 +156,7 @@ Clients that only support stdio can use [`mcp-remote`](https://www.npmjs.com/pac
 | `NANOGPT_BASE_URL` | `https://nano-gpt.com/api/v1` | API base URL. |
 | `VAST_API_KEY` | — | Vast.ai API key for the `vast` server. |
 | `VAST_MAX_PRICE_PER_HOUR` | — | Refuse to rent offers above this $/hr. |
-| `VAST_AUTO_DESTROY_MINUTES` | — | Default auto-destroy deadline for new instances. |
+| `VAST_AUTO_DESTROY_MINUTES` | `120` | Default auto-destroy deadline for new instances; `0` turns it off. |
 | `VAST_SSH_KEY_PATH` | `.data/vast_ed25519` | Key used to reach instances (created if missing). |
 | `SSH_KEY_PATH`, `SSH_KEY_PASSPHRASE` | `~/.ssh/id_*` | Key for the `ssh` server. |
 | `SSH_HOSTS_FILE` | — | JSON file of named hosts. |

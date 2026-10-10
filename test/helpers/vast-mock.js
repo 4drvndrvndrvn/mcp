@@ -24,6 +24,14 @@ export const DESKTOP_TEMPLATE = {
 };
 
 const PYTORCH_TEMPLATE = { ...DESKTOP_TEMPLATE, id: 2, hash_id: 'aaaa', name: 'PyTorch (Vast)', image: 'vastai/pytorch', desc: 'PyTorch' };
+// Docker ENTRYPOINT launch mode: the container runs its own program and has no SSH.
+export const NO_SSH_TEMPLATE = { ...DESKTOP_TEMPLATE, id: 3, hash_id: 'bbbb', name: 'Ollama API', image: 'vastai/ollama', runtype: 'args', use_ssh: false, desc: 'Ollama API server', extra_filters: '{}' };
+
+// Images that never start: one can't be pulled, the other's container exits right away.
+export const FAILING_IMAGES = {
+  'bad/image': { status: 'loading', msg: 'Error response from daemon: pull access denied for bad/image, repository does not exist' },
+  'crash/image': { status: 'exited', msg: 'Exited (1) 2 seconds ago' },
+};
 
 export const OFFERS = [
   { id: 1001, ask_contract_id: 1001, num_gpus: 1, gpu_name: 'RTX 3060', gpu_ram: 12288, dph_total: 0.0756, cpu_cores_effective: 8, cpu_ram: 32000, disk_space: 100, inet_down: 600, inet_up: 500, reliability: 0.993, geolocation: 'South Korea, KR', cuda_max_good: 12.8, duration: 864000 },
@@ -34,6 +42,8 @@ export async function startVastMock({
   apiKey = 'test-key',
   bootMs = 300,
   runtype = 'jupyter',
+  // Delay before answering a rental, e.g. to cancel a call while it is in flight.
+  createDelayMs = 0,
   // Commands sent to instances run here (a fresh temp dir by default, never the repo).
   instanceCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'vast-instance-')),
   // Optional: answer instance commands without running them (see startSshServer).
@@ -71,7 +81,7 @@ export async function startVastMock({
     }
     if (req.method === 'GET' && p === '/api/v0/template/') {
       const filters = JSON.parse(url.searchParams.get('select_filters') || '{}');
-      let templates = [DESKTOP_TEMPLATE, PYTORCH_TEMPLATE];
+      let templates = [DESKTOP_TEMPLATE, PYTORCH_TEMPLATE, NO_SSH_TEMPLATE];
       if (filters.hash_id) templates = templates.filter((t) => t.hash_id === filters.hash_id.eq);
       return json(res, 200, { success: true, templates });
     }
@@ -83,13 +93,19 @@ export async function startVastMock({
     if (req.method === 'PUT' && (m = p.match(/^\/api\/v0\/asks\/(\d+)\/$/))) {
       const offer = OFFERS.find((o) => o.id === Number(m[1]));
       if (!offer) return json(res, 400, { success: false, error: 'invalid_args', msg: 'offer not found' });
+      if (createDelayMs) await new Promise((r) => setTimeout(r, createDelayMs));
       const id = nextId++;
+      const template = [DESKTOP_TEMPLATE, PYTORCH_TEMPLATE, NO_SSH_TEMPLATE].find((t) => t.hash_id === data.template_hash_id);
+      const failure = FAILING_IMAGES[data.image];
       const inst = { id, offer, payload: data, keys: [], status: 'loading', intended: 'running', created: Date.now(), ssh: null };
+      inst.runtype = template?.runtype ?? runtype;
       inst.ssh = await startSshServer({ authorizedKeys: () => inst.keys, cwd: instanceCwd, handler: execHandler });
       instances.set(id, inst);
       history.push(inst);
       setTimeout(() => {
-        if (inst.status === 'loading') inst.status = 'running';
+        if (inst.status !== 'loading') return;
+        inst.status = failure ? failure.status : 'running';
+        if (failure) inst.msg = failure.msg;
       }, bootMs);
       return json(res, 200, { success: true, new_contract: id });
     }
@@ -129,16 +145,16 @@ export async function startVastMock({
     id: inst.id,
     actual_status: inst.status,
     intended_status: inst.intended,
-    status_msg: inst.status === 'loading' ? 'Pulling image vastai/linux-desktop' : 'success, running',
+    status_msg: inst.msg ?? (inst.status === 'loading' ? 'Pulling image vastai/linux-desktop' : 'success, running'),
     num_gpus: inst.offer.num_gpus,
     gpu_name: inst.offer.gpu_name,
     dph_total: inst.offer.dph_total,
     image_uuid: inst.payload.image || 'vastai/linux-desktop',
-    image_runtype: runtype,
+    image_runtype: inst.runtype,
     label: inst.payload.label,
     start_date: inst.created / 1000,
     ssh_host: '127.0.0.1',
-    ssh_port: inst.ssh.port - (runtype.includes('jupyter') ? 1 : 0),
+    ssh_port: inst.ssh.port - (inst.runtype.includes('jupyter') ? 1 : 0),
     public_ipaddr: inst.status === 'running' ? '127.0.0.1' : null,
     ports: {},
   });

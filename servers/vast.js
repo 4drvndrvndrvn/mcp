@@ -4,7 +4,7 @@
 // Settings (from .env or the environment):
 //   VAST_API_KEY              required for everything except searching offers/templates
 //   VAST_MAX_PRICE_PER_HOUR   optional: refuse to rent offers that cost more than this ($/hr)
-//   VAST_AUTO_DESTROY_MINUTES optional: destroy instances created here after this many minutes unless told otherwise
+//   VAST_AUTO_DESTROY_MINUTES destroy instances created here after this many minutes unless told otherwise (default 120, 0 = never)
 //   VAST_SSH_KEY_PATH         key used to reach instances (default: .data/vast_ed25519, created automatically)
 //   VAST_API_URL              API base URL (default https://console.vast.ai)
 
@@ -23,7 +23,10 @@ import {
   formatOffer,
   formatTemplate,
   instanceStatus,
+  launchModeHasSsh,
   sshEndpoints,
+  startupProblem,
+  templateHasSsh,
 } from './lib/vast.js';
 
 loadEnv();
@@ -39,39 +42,94 @@ const POLL_MS = Number(process.env.VAST_POLL_MS) || 10_000;
 
 // ---- Auto-destroy safety net ------------------------------------------------
 // Deadlines are saved to disk so an instance whose deadline passed while the app was
-// down is destroyed the next time this server starts.
+// down is destroyed the next time this server starts. The file is the source of truth:
+// other copies of this server (say, one in the web app and one in Claude Code) share it,
+// so every change is merged into it and a deadline is re-read from it before it runs.
 
-const MAX_AUTO_DESTROY_MINUTES = 7 * 24 * 60; // setTimeout can't wait much longer than 24 days
-const defaultAutoDestroy = Number(process.env.VAST_AUTO_DESTROY_MINUTES) || null;
+const MAX_AUTO_DESTROY_MINUTES = 7 * 24 * 60;
+const MAX_TIMER_MS = 2 ** 31 - 1; // longer setTimeout delays fire immediately
+const SCHEDULE_SYNC_MS = 60_000;
+
+/** VAST_AUTO_DESTROY_MINUTES, 120 when unset; 0 turns the default off. */
+function parseDefaultAutoDestroy(raw) {
+  if (raw === undefined || raw.trim() === '') return 120;
+  const minutes = Number(raw);
+  if (Number.isFinite(minutes) && minutes >= 0) return Math.min(minutes, MAX_AUTO_DESTROY_MINUTES);
+  console.error(`[vast] ignoring invalid VAST_AUTO_DESTROY_MINUTES=${raw}; using 120`);
+  return 120;
+}
+
+const defaultAutoDestroy = parseDefaultAutoDestroy(process.env.VAST_AUTO_DESTROY_MINUTES);
 const scheduleFile = path.resolve(ROOT_DIR, process.env.VAST_AUTO_DESTROY_FILE || '.data/vast-auto-destroy.json');
 const autoDestroy = new Map(); // instance id -> { at, timer }
 
-function saveSchedule() {
+/** The saved deadlines, { instanceId: epochMs }. */
+function readSchedule() {
+  let data;
   try {
+    data = JSON.parse(fs.readFileSync(scheduleFile, 'utf8'));
+  } catch {
+    return {};
+  }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return {};
+  return Object.fromEntries(Object.entries(data).filter(([, at]) => typeof at === 'number' && Number.isFinite(at)));
+}
+
+/** Applies one change to the saved deadlines, keeping the ones other copies of this server wrote. */
+function editSchedule(change) {
+  try {
+    const data = readSchedule();
+    change(data);
     fs.mkdirSync(path.dirname(scheduleFile), { recursive: true });
-    const data = Object.fromEntries([...autoDestroy].map(([id, e]) => [id, e.at]));
-    fs.writeFileSync(scheduleFile, `${JSON.stringify(data, null, 2)}\n`);
+    // Write then rename, so another copy never reads a half-written file.
+    const tmpFile = `${scheduleFile}.${process.pid}.tmp`;
+    fs.writeFileSync(tmpFile, `${JSON.stringify(data, null, 2)}\n`);
+    fs.renameSync(tmpFile, scheduleFile);
   } catch (err) {
     console.error(`[vast] could not save ${scheduleFile}: ${err.message}`);
   }
 }
 
-function cancelAutoDestroy(id) {
-  const entry = autoDestroy.get(id);
-  if (!entry) return;
-  clearTimeout(entry.timer);
+function setTimer(id, at) {
+  clearTimeout(autoDestroy.get(id)?.timer);
+  const timer = setTimeout(() => runAutoDestroy(id), Math.min(Math.max(0, at - Date.now()), MAX_TIMER_MS));
+  autoDestroy.set(id, { at, timer });
+}
+
+function clearTimer(id) {
+  clearTimeout(autoDestroy.get(id)?.timer);
   autoDestroy.delete(id);
-  saveSchedule();
+}
+
+function cancelAutoDestroy(id) {
+  clearTimer(id);
+  editSchedule((data) => {
+    delete data[id];
+  });
 }
 
 function scheduleAutoDestroy(id, at) {
-  clearTimeout(autoDestroy.get(id)?.timer);
-  const timer = setTimeout(() => runAutoDestroy(id), Math.max(0, at - Date.now()));
-  autoDestroy.set(id, { at, timer });
-  saveSchedule();
+  setTimer(id, at);
+  editSchedule((data) => {
+    data[id] = at;
+  });
+}
+
+/** Picks up deadlines that other copies of this server set, moved or cancelled. */
+function syncSchedule() {
+  const saved = readSchedule();
+  for (const id of autoDestroy.keys()) if (!(id in saved)) clearTimer(id);
+  for (const [key, at] of Object.entries(saved)) {
+    const id = Number(key);
+    if (autoDestroy.get(id)?.at !== at) setTimer(id, at);
+  }
 }
 
 async function runAutoDestroy(id) {
+  // Another copy of this server may have cancelled or moved the deadline.
+  const at = readSchedule()[id];
+  if (at === undefined) return clearTimer(id);
+  if (at > Date.now()) return setTimer(id, at);
   try {
     await api.destroy(id);
     console.error(`[vast] auto-destroyed instance ${id}`);
@@ -86,11 +144,8 @@ async function runAutoDestroy(id) {
 }
 
 if (api.apiKey) {
-  try {
-    for (const [id, at] of Object.entries(JSON.parse(fs.readFileSync(scheduleFile, 'utf8')))) scheduleAutoDestroy(Number(id), at);
-  } catch {
-    // No saved schedule.
-  }
+  syncSchedule();
+  setInterval(syncSchedule, SCHEDULE_SYNC_MS).unref();
 }
 
 const describe = (inst) => {
@@ -151,6 +206,11 @@ async function requireInstance(id, signal) {
 }
 
 const instanceId = z.number().int().positive().describe('Instance id (from vast_create_instance or vast_list_instances)');
+
+// How many checks in a row (POLL_MS apart, ~10 s) a startup problem must last before
+// vast_wait_for_instance gives up. An exited container gets longer: a stopped instance
+// that was just started still reads "exited" until its host starts it again.
+const FAILED_CHECKS = { error: 3, down: 12 };
 
 const server = new McpServer({ name: 'vast', version: '1.0.0' });
 
@@ -296,13 +356,18 @@ server.registerTool(
       bid_price: z.number().positive().optional().describe('For an interruptible instance: your bid in $/hr'),
       auto_destroy_minutes: z
         .number()
-        .positive()
+        .min(0)
         .max(MAX_AUTO_DESTROY_MINUTES)
         .optional()
         .describe(
-          'Safety net: destroy the instance automatically after this many minutes, even if vast_destroy_instance is never called. ' +
-            `Good for short tasks.${defaultAutoDestroy ? ` Default: ${defaultAutoDestroy}.` : ''}`,
+          'Safety net: destroy the instance (and its data) automatically after this many minutes, even if vast_destroy_instance ' +
+            'is never called. Set it longer than the whole task; 0 means never. ' +
+            (defaultAutoDestroy ? `Default: ${defaultAutoDestroy}.` : 'Default: never.'),
         ),
+      allow_no_ssh: z
+        .boolean()
+        .optional()
+        .describe("Rent a template that has no SSH anyway (vast_exec won't work on it; use its own ports instead)"),
     },
     annotations: { destructiveHint: false, openWorldHint: true },
   },
@@ -313,6 +378,13 @@ server.registerTool(
     if (template_hash) {
       template = await api.getTemplate(template_hash, { signal: extra.signal });
       if (!template) throw new Error(`No template with hash ${template_hash}. Use vast_search_templates to find one.`);
+    }
+    const noSsh = template && !templateHasSsh(template);
+    if (noSsh && !args.allow_no_ssh) {
+      throw new Error(
+        `Template "${template.name}" has no SSH (launch mode ${template.runtype}), so vast_exec could never reach the instance. ` +
+          'Nothing was rented. Pick a template with SSH or jupyter launch mode, or pass allow_no_ssh: true if you only need its own ports.',
+      );
     }
     const disk = args.disk_gb ?? template?.recommended_disk_space ?? 20;
 
@@ -344,20 +416,30 @@ server.registerTool(
       runtype: template ? undefined : 'ssh_direc ssh_proxy',
       price: bid_price,
     });
-    const res = await api.createInstance(offer_id, payload, { signal: extra.signal });
+    if (extra.signal?.aborted) throw new Error('Cancelled');
+    // No abort signal from here on: once Vast.ai has the request it may rent the machine
+    // even if we stop waiting, and only its answer tells us which instance to clean up.
+    const res = await api.createInstance(offer_id, payload);
     const id = res.new_contract;
     if (!id) throw new Error(`Vast.ai did not return an instance id: ${JSON.stringify(res)}`);
-
     const minutes = args.auto_destroy_minutes ?? defaultAutoDestroy;
-    if (minutes) {
-      scheduleAutoDestroy(id, Date.now() + minutes * 60_000);
-      notes.push(`It will be destroyed automatically in ${minutes} minutes (change with vast_set_auto_destroy).`);
-    }
+    if (minutes) scheduleAutoDestroy(id, Date.now() + minutes * 60_000);
+    let keyError = null;
     try {
-      await attachKey(id, extra.signal);
+      await attachKey(id);
     } catch (err) {
-      notes.push(`The SSH key could not be attached yet (${err.message}); vast_wait_for_instance will retry.`);
+      keyError = err.message;
     }
+    if (extra.signal?.aborted) {
+      // Rented while being cancelled, so nobody will hear about it: give it back now
+      // (retried every minute if that fails).
+      scheduleAutoDestroy(id, Date.now());
+      throw new Error(`Cancelled. Instance ${id} was rented anyway and is being destroyed.`);
+    }
+
+    if (minutes) notes.push(`It will be destroyed automatically in ${minutes} minutes (change with vast_set_auto_destroy).`);
+    if (noSsh) notes.push("This template has no SSH, so vast_exec won't work; reach it through its own ports.");
+    if (keyError) notes.push(`The SSH key could not be attached yet (${keyError}); vast_wait_for_instance will retry.`);
     const what = template ? `template "${template.name}"` : `image ${image}`;
     const machine = offer ? ` (${offer.num_gpus}x ${offer.gpu_name}, ~$${offer.dph_total.toFixed(3)}/hr)` : '';
     return text(
@@ -415,6 +497,7 @@ server.registerTool(
     const started = Date.now();
     const deadline = started + timeout_seconds * 1000;
     let lastProblem = '';
+    let failure = { kind: null, checks: 0 };
     while (true) {
       const elapsed = Math.round((Date.now() - started) / 1000);
       const inst = await api.getInstance(instance_id, { signal: extra.signal });
@@ -431,8 +514,24 @@ server.registerTool(
       if (inst.intended_status === 'stopped' && status !== 'running') {
         return text(`Instance ${instance_id} is stopped. Start it with vast_start_instance.\n${describe(inst)}`, true);
       }
+      const problem = startupProblem(inst);
+      failure = problem ? { kind: problem.kind, checks: problem.kind === failure.kind ? failure.checks + 1 : 1 } : { kind: null, checks: 0 };
+      if (problem && failure.checks >= FAILED_CHECKS[problem.kind]) {
+        return text(
+          `Instance ${instance_id} failed to start: ${problem.message}\n${describe(inst)}\n` +
+            'It is still billed: check vast_instance_logs if you need to know more, then destroy it with vast_destroy_instance ' +
+            'and try another offer or image.',
+          true,
+        );
+      }
       if (status === 'running') {
         if (!check_ssh) return text(`Instance ${instance_id} is running.\n${describe(inst)}`);
+        if (!launchModeHasSsh(inst.image_runtype)) {
+          return text(
+            `Instance ${instance_id} is running. Its launch mode (${inst.image_runtype}) has no SSH, so vast_exec can't be used; ` +
+              `reach it through its own ports.\n${describe(inst)}`,
+          );
+        }
         try {
           await attachKey(instance_id, extra.signal);
           const { endpoint, result } = await execOnInstance(inst, 'echo ready', { timeoutMs: 20_000, signal: extra.signal });
@@ -482,6 +581,9 @@ server.registerTool(
     const inst = await requireInstance(instance_id, extra.signal);
     if (instanceStatus(inst) !== 'running') {
       return text(`Instance ${instance_id} is ${instanceStatus(inst)}, not running. Call vast_wait_for_instance first.`, true);
+    }
+    if (!launchModeHasSsh(inst.image_runtype)) {
+      return text(`Instance ${instance_id} has no SSH (launch mode ${inst.image_runtype}), so commands can't be run on it.`, true);
     }
     await attachKey(instance_id, extra.signal);
     const timeoutMs = timeout_seconds * 1000;

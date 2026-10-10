@@ -144,11 +144,22 @@ export function formatOffer(o) {
   ].join(' | ');
 }
 
+/** Whether a launch mode (a template's runtype or an instance's image_runtype) gives SSH access. Unknown counts as yes. */
+export function launchModeHasSsh(runtype) {
+  return !runtype || /ssh|jupyter/i.test(String(runtype));
+}
+
+/** Whether instances of a template can be reached over SSH (Docker ENTRYPOINT "args" templates can't). */
+export function templateHasSsh(t) {
+  return t.use_ssh === true || launchModeHasSsh(t.runtype);
+}
+
 export function formatTemplate(t) {
   const lines = [
     `template "${t.name}" — hash ${t.hash_id}`,
     `  image: ${t.image}${t.tag ? `:${t.tag}` : ''} | launch mode: ${t.runtype}${t.use_ssh ? ' + ssh' : ''} | recommended disk: ${t.recommended_disk_space ?? '?'} GB`,
   ];
+  if (!templateHasSsh(t)) lines.push('  no SSH: vast_exec and vast_wait_for_instance SSH checks will not work on it');
   if (t.desc) lines.push(`  ${String(t.desc).trim().slice(0, 200)}`);
   if (!t.recommended) {
     lines.push(`  community template by user ${t.creator_id} (not reviewed by Vast.ai)`);
@@ -172,6 +183,24 @@ export function sshEndpoints(inst) {
 
 export function instanceStatus(inst) {
   return inst.actual_status || inst.cur_state || 'scheduling';
+}
+
+const ERROR_MESSAGE = /\berror\b|\bfailed\b|\bdenied\b/i;
+
+/**
+ * Why an instance that should be starting looks like it failed, or null. An error message
+ * (e.g. the image could not be pulled) and an exited or offline container both count;
+ * callers should only give up once the problem persists, since both can be momentary.
+ */
+export function startupProblem(inst) {
+  const status = instanceStatus(inst);
+  if (status === 'running' || inst.intended_status === 'stopped') return null;
+  const msg = String(inst.status_msg || '').trim();
+  if (msg && ERROR_MESSAGE.test(msg)) return { kind: 'error', message: msg.slice(0, 500) };
+  if (status === 'exited' || status === 'offline') {
+    return { kind: 'down', message: `the instance is ${status}${msg ? ` (${msg.slice(0, 300)})` : ''}` };
+  }
+  return null;
 }
 
 export function formatInstance(inst) {

@@ -5,8 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { VastAPI, sshEndpoints, formatOffer, buildCreatePayload } from '../servers/lib/vast.js';
-import { startVastMock, DESKTOP_TEMPLATE } from './helpers/vast-mock.js';
+import { VastAPI, sshEndpoints, formatOffer, formatTemplate, buildCreatePayload, startupProblem, templateHasSsh } from '../servers/lib/vast.js';
+import { startVastMock, DESKTOP_TEMPLATE, NO_SSH_TEMPLATE } from './helpers/vast-mock.js';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vast-test-'));
@@ -233,5 +233,169 @@ test('vast_exec run_as_user wraps the command for a normal user', async () => {
   } finally {
     await client.close();
     await dry.close();
+  }
+});
+
+const createdId = (r) => Number(r.text.match(/Created instance (\d+)/)[1]);
+const readJson = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
+const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+
+test('vast_wait_for_instance gives up on an image that cannot be pulled', async () => {
+  const { client, call } = await connect({ VAST_API_KEY: 'test-key' });
+  try {
+    const id = createdId(await call('vast_create_instance', { offer_id: 1001, image: 'bad/image' }));
+    const r = await call('vast_wait_for_instance', { instance_id: id, timeout_seconds: 60 });
+    assert.equal(r.isError, true);
+    assert.match(r.text, /failed to start: Error response from daemon: pull access denied/);
+    assert.match(r.text, /vast_destroy_instance/);
+    await call('vast_destroy_instance', { instance_id: id });
+  } finally {
+    await client.close();
+  }
+});
+
+test('vast_wait_for_instance gives up on a container that keeps exiting', async () => {
+  const { client, call } = await connect({ VAST_API_KEY: 'test-key' });
+  try {
+    const id = createdId(await call('vast_create_instance', { offer_id: 1001, image: 'crash/image' }));
+    const r = await call('vast_wait_for_instance', { instance_id: id, timeout_seconds: 60 });
+    assert.equal(r.isError, true);
+    assert.match(r.text, /failed to start: the instance is exited \(Exited \(1\)/);
+    await call('vast_destroy_instance', { instance_id: id });
+  } finally {
+    await client.close();
+  }
+});
+
+test('startupProblem only reports instances that should be starting', () => {
+  assert.equal(startupProblem({ actual_status: 'loading', status_msg: 'Pulling image vastai/linux-desktop' }), null);
+  assert.equal(startupProblem({ actual_status: 'running', status_msg: 'Error: something old' }), null);
+  assert.equal(startupProblem({ actual_status: 'exited', intended_status: 'stopped' }), null);
+  assert.deepEqual(startupProblem({ actual_status: 'loading', status_msg: 'Error response from daemon: manifest unknown' }), {
+    kind: 'error',
+    message: 'Error response from daemon: manifest unknown',
+  });
+  assert.equal(startupProblem({ actual_status: 'offline', intended_status: 'running' }).kind, 'down');
+  assert.equal(startupProblem({ actual_status: 'exited', intended_status: 'running', status_msg: 'Exited (0)' }).kind, 'down');
+});
+
+test('templates without SSH are refused unless allow_no_ssh is set', async () => {
+  const { client, call } = await connect({ VAST_API_KEY: 'test-key' });
+  try {
+    assert.equal(templateHasSsh(DESKTOP_TEMPLATE), true);
+    assert.equal(templateHasSsh(NO_SSH_TEMPLATE), false);
+    assert.match(formatTemplate(NO_SSH_TEMPLATE), /no SSH: vast_exec/);
+    assert.doesNotMatch(formatTemplate(DESKTOP_TEMPLATE), /no SSH/);
+
+    const rentals = () => mock.requests.filter((r) => r.path.startsWith('/api/v0/asks/')).length;
+    const before = rentals();
+    const refused = await call('vast_create_instance', { offer_id: 1001, template_hash: NO_SSH_TEMPLATE.hash_id });
+    assert.equal(refused.isError, true);
+    assert.match(refused.text, /has no SSH .*Nothing was rented/);
+    assert.equal(rentals(), before, 'nothing was rented');
+
+    const created = await call('vast_create_instance', { offer_id: 1001, template_hash: NO_SSH_TEMPLATE.hash_id, allow_no_ssh: true });
+    assert.equal(created.isError, false, created.text);
+    assert.match(created.text, /no SSH, so vast_exec won't work/);
+    const id = createdId(created);
+
+    const ready = await call('vast_wait_for_instance', { instance_id: id, timeout_seconds: 30 });
+    assert.equal(ready.isError, false, ready.text);
+    assert.match(ready.text, /is running\. Its launch mode \(args\) has no SSH/);
+    const exec = await call('vast_exec', { instance_id: id, command: 'echo hi' });
+    assert.equal(exec.isError, true);
+    assert.match(exec.text, /has no SSH/);
+    await call('vast_destroy_instance', { instance_id: id });
+  } finally {
+    await client.close();
+  }
+});
+
+test('new instances get a 120 minute auto-destroy by default, and 0 opts out', async () => {
+  const file = path.join(tmp, 'defaults.json');
+  const { client, call } = await connect({ VAST_API_KEY: 'test-key', VAST_AUTO_DESTROY_FILE: file });
+  try {
+    const tool = (await client.listTools()).tools.find((t) => t.name === 'vast_create_instance');
+    assert.match(tool.inputSchema.properties.auto_destroy_minutes.description, /Default: 120\./);
+
+    const plain = await call('vast_create_instance', { offer_id: 1001, image: 'ubuntu' });
+    assert.match(plain.text, /destroyed automatically in 120 minutes/);
+    const a = createdId(plain);
+    const deadline = readJson(file)[a];
+    assert.ok(Math.abs(deadline - (Date.now() + 120 * 60_000)) < 60_000);
+
+    const never = await call('vast_create_instance', { offer_id: 1001, image: 'ubuntu', auto_destroy_minutes: 0 });
+    assert.equal(never.isError, false, never.text);
+    assert.doesNotMatch(never.text, /destroyed automatically/);
+    const b = createdId(never);
+    assert.equal(String(b) in readJson(file), false);
+    await call('vast_destroy_instance', { instance_id: a });
+    await call('vast_destroy_instance', { instance_id: b });
+  } finally {
+    await client.close();
+  }
+
+  const off = await connect({ VAST_API_KEY: 'test-key', VAST_AUTO_DESTROY_FILE: file, VAST_AUTO_DESTROY_MINUTES: '0' });
+  try {
+    const tool = (await off.client.listTools()).tools.find((t) => t.name === 'vast_create_instance');
+    assert.match(tool.inputSchema.properties.auto_destroy_minutes.description, /Default: never\./);
+    const r = await off.call('vast_create_instance', { offer_id: 1001, image: 'ubuntu' });
+    assert.doesNotMatch(r.text, /destroyed automatically/);
+    await off.call('vast_destroy_instance', { instance_id: createdId(r) });
+  } finally {
+    await off.client.close();
+  }
+});
+
+test('two copies of the server share the auto-destroy file without losing deadlines', async () => {
+  const file = path.join(tmp, 'shared.json');
+  const env = { VAST_API_KEY: 'test-key', VAST_AUTO_DESTROY_FILE: file };
+  const a = await connect(env);
+  const b = await connect(env);
+  try {
+    const x = createdId(await a.call('vast_create_instance', { offer_id: 1001, image: 'ubuntu', auto_destroy_minutes: 60 }));
+    const y = createdId(await b.call('vast_create_instance', { offer_id: 1001, image: 'ubuntu', auto_destroy_minutes: 60 }));
+    assert.deepEqual(Object.keys(readJson(file)).map(Number).sort(), [x, y].sort(), "b kept a's deadline");
+
+    // a's timers fire in ~1 s, but b moves one deadline later and cancels the other.
+    const moved = createdId(await a.call('vast_create_instance', { offer_id: 1001, image: 'ubuntu', auto_destroy_minutes: 0.02 }));
+    const cancelled = createdId(await a.call('vast_create_instance', { offer_id: 1001, image: 'ubuntu', auto_destroy_minutes: 0.02 }));
+    assert.equal((await b.call('vast_set_auto_destroy', { instance_id: moved, minutes: 60 })).isError, false);
+    assert.equal((await b.call('vast_set_auto_destroy', { instance_id: cancelled, minutes: 0 })).isError, false);
+    await pause(2500);
+    assert.ok(mock.instances.has(moved), 'a respected the later deadline');
+    assert.ok(mock.instances.has(cancelled), 'a respected the cancellation');
+    const saved = readJson(file);
+    assert.ok(saved[moved] > Date.now() + 50 * 60_000);
+    assert.equal(String(cancelled) in saved, false);
+
+    for (const id of [x, y, moved, cancelled]) await a.call('vast_destroy_instance', { instance_id: id });
+    assert.deepEqual(readJson(file), {});
+  } finally {
+    await a.client.close();
+    await b.client.close();
+  }
+});
+
+test('an instance rented while the call was being cancelled is destroyed', async () => {
+  const slow = await startVastMock({ bootMs: 0, createDelayMs: 600 });
+  const file = path.join(tmp, 'cancel.json');
+  const client = new Client({ name: 'test', version: '1' });
+  await client.connect(new StdioClientTransport({
+    command: process.execPath,
+    args: [path.join(ROOT, 'servers/vast.js')],
+    env: { VAST_API_URL: slow.url, VAST_API_KEY: 'test-key', VAST_SSH_KEY_PATH: path.join(tmp, 'vast_key'), VAST_AUTO_DESTROY_FILE: file, VAST_POLL_MS: '50' },
+  }));
+  try {
+    const controller = new AbortController();
+    const pending = client.callTool({ name: 'vast_create_instance', arguments: { offer_id: 1001, image: 'ubuntu' } }, undefined, { signal: controller.signal });
+    await waitFor(() => slow.requests.some((r) => r.path === '/api/v0/asks/1001/'));
+    controller.abort();
+    await assert.rejects(pending);
+    await waitFor(() => slow.history.length === 1 && slow.history[0].status === 'destroyed');
+    await waitFor(() => fs.existsSync(file) && Object.keys(readJson(file)).length === 0);
+  } finally {
+    await client.close();
+    await slow.close();
   }
 });
