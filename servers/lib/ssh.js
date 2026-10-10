@@ -274,6 +274,24 @@ export class SshPool {
   }
 
   /**
+   * Starts a command and resolves with its channel (stdin, stdout and .stderr) for a
+   * long-lived conversation, such as an MCP server over stdio.
+   */
+  async spawn(target, command, { hostKeys } = {}) {
+    const conn = await this.connect(target, hostKeys);
+    const key = this.keyFor(target);
+    return new Promise((resolve, reject) => {
+      conn.exec(command, (err, stream) => {
+        if (err) return reject(err);
+        // An open channel keeps its connection from being closed as idle.
+        const keepAlive = setInterval(() => this._touch(key), 60_000);
+        stream.on('close', () => clearInterval(keepAlive));
+        resolve(stream);
+      });
+    });
+  }
+
+  /**
    * Runs a command. Resolves with { code, signal, stdout, stderr, timedOut }; rejects only
    * if the command could not be started (connection or auth failure).
    */

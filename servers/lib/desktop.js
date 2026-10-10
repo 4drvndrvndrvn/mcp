@@ -21,10 +21,10 @@ export const DESKTOP_ACTIONS = [
   'launch',
 ];
 
-// Finds the X display the desktop runs on by looking for a process that has DISPLAY set,
-// preferring one owned by a normal user (the desktop session). DESK_PID is that process,
-// whose environment `launch` reuses so apps start inside the desktop session.
-const PRELUDE = String.raw`
+// Finds the desktop session by looking for a process that has DISPLAY set, preferring one
+// owned by a normal user. DESK_PID is that process: `launch` and the Studio MCP bridge reuse
+// its environment so programs run inside the desktop session, as its user.
+export const FIND_SESSION = String.raw`
 DESK_PID=""; ROOT_PID=""; ROOT_DISPLAY=""; ROOT_XAUTH=""
 for e in /proc/[0-9]*/environ; do
   d=$(tr '\0' '\n' 2>/dev/null < "$e" | sed -n 's/^DISPLAY=//p' | head -n1)
@@ -39,6 +39,22 @@ for e in /proc/[0-9]*/environ; do
   if [ -z "$ROOT_PID" ]; then ROOT_PID=$pid; ROOT_DISPLAY=$d; ROOT_XAUTH=$xa; fi
 done
 if [ -z "$DESK_PID" ] && [ -n "$ROOT_PID" ]; then DESK_PID=$ROOT_PID; DISPLAY=$ROOT_DISPLAY; XAUTHORITY=$ROOT_XAUTH; fi
+
+# Writes the session's environment to a file its user can source, and sets DESK_USER.
+desk_envfile() {
+  DESK_USER=root
+  envf=$(mktemp)
+  if [ -n "$DESK_PID" ] && [ -r "/proc/$DESK_PID/environ" ]; then
+    DESK_USER=$(stat -c %U "/proc/$DESK_PID")
+    tr '\0' '\n' < "/proc/$DESK_PID/environ" | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' | sed "s/'/'\\\\''/g; s/^\([^=]*\)=\(.*\)$/export \1='\2'/" > "$envf"
+  elif [ -n "$DISPLAY" ]; then
+    echo "export DISPLAY='$DISPLAY'" > "$envf"
+  fi
+  chown "$DESK_USER" "$envf"; chmod 600 "$envf"
+}
+`;
+
+const PRELUDE = String.raw`
 if [ -z "$DESK_PID" ]; then
   DISPLAY=$WANT_DISPLAY
   if [ -z "$DISPLAY" ]; then
@@ -73,17 +89,9 @@ sx() { awk -v v="$1" -v w="$SCREEN_W" -v m="$MAX_W" 'BEGIN { f = (w > m) ? w / m
 // Starts a command in the background as the desktop user, with the desktop session's environment.
 const LAUNCH = String.raw`
 desk_launch() {
-  u=root
-  envf=$(mktemp)
-  if [ -n "$DESK_PID" ] && [ -r "/proc/$DESK_PID/environ" ]; then
-    u=$(stat -c %U "/proc/$DESK_PID")
-    tr '\0' '\n' < "/proc/$DESK_PID/environ" | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' | sed "s/'/'\\\\''/g; s/^\([^=]*\)=\(.*\)$/export \1='\2'/" > "$envf"
-  else
-    echo "export DISPLAY='$DISPLAY'" > "$envf"
-  fi
-  chown "$u" "$envf"; chmod 600 "$envf"
-  runuser -u "$u" -- sh -c '. "$1"; rm -f "$1"; cd "$HOME" 2>/dev/null || cd /tmp; nohup sh -c "$2" >>/tmp/desktop-launch-$(id -un).log 2>&1 </dev/null &' _ "$envf" "$1"
-  echo "launched as $u" >&2
+  desk_envfile
+  runuser -u "$DESK_USER" -- sh -c '. "$1"; rm -f "$1"; cd "$HOME" 2>/dev/null || cd /tmp; nohup sh -c "$2" >>/tmp/desktop-launch-$(id -un).log 2>&1 </dev/null &' _ "$envf" "$1"
+  echo "launched as $DESK_USER" >&2
 }
 `;
 
@@ -169,6 +177,7 @@ export function desktopScript({ actions = [], screenshot = true, waitMs = 0, dis
   const lines = [
     `MAX_W=${Math.max(200, Math.round(maxWidth))}`,
     `WANT_DISPLAY=${shellQuote(display || '')}`,
+    FIND_SESSION,
     PRELUDE,
     LAUNCH,
     'set -e',
@@ -193,4 +202,18 @@ export function parseScreenshot(stdout) {
 export function shownSize(screen, maxWidth = SCREENSHOT_MAX_WIDTH) {
   if (screen.width <= maxWidth) return { ...screen };
   return { width: maxWidth, height: Math.round((screen.height * maxWidth) / screen.width) };
+}
+
+/**
+ * Runs `command` in the foreground as the desktop session's user, with its environment
+ * (as root when there is no desktop). Its stdin and stdout stay connected, e.g. for an
+ * MCP server spoken to over SSH.
+ */
+export function sessionExecScript(command) {
+  return [
+    "WANT_DISPLAY=''",
+    FIND_SESSION,
+    'desk_envfile',
+    `exec runuser -u "$DESK_USER" -- sh -c '. "$1"; rm -f "$1"; cd "$HOME" 2>/dev/null || cd /tmp; exec sh -c "$2"' _ "$envf" ${shellQuote(command)}`,
+  ].join('\n');
 }

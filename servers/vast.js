@@ -7,15 +7,19 @@
 //   VAST_AUTO_DESTROY_MINUTES optional: destroy instances created here after this many minutes unless told otherwise
 //   VAST_SSH_KEY_PATH         key used to reach instances (default: .data/vast_ed25519, created automatically)
 //   VAST_API_URL              API base URL (default https://console.vast.ai)
+//   VAST_TUXBLOX_REPO         GitHub repository whose releases vast_install_tuxblox installs (default 4drvndrvndrvn/tuxblox)
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { ROOT_DIR, loadEnv, progressReporter, safe, sleep, text } from './lib/common.js';
 import { SshPool, asUser, ensureKeyPair, formatExecResult } from './lib/ssh.js';
-import { DESKTOP_ACTIONS, SCREENSHOT_MAX_WIDTH, desktopScript, parseScreenshot, shownSize } from './lib/desktop.js';
+import { DESKTOP_ACTIONS, SCREENSHOT_MAX_WIDTH, desktopScript, parseScreenshot, sessionExecScript, shownSize } from './lib/desktop.js';
+import { SshStdioTransport } from './lib/ssh-transport.js';
+import { DEFAULT_STUDIO_MCP_COMMAND, DEFAULT_TUXBLOX_REPO, tuxbloxInstallScript } from './lib/tuxblox.js';
 import {
   VastAPI,
   VAST_DEFAULT_URL,
@@ -115,8 +119,15 @@ async function attachKey(id, signal) {
 }
 
 function closeConnections(id) {
+  studioClients.get(id)?.then((c) => c.close()).catch(() => {});
+  studioClients.delete(id);
   for (const key of connectionsByInstance.get(id) || []) pool.close(key);
   connectionsByInstance.delete(id);
+}
+
+function trackConnection(id, target) {
+  if (!connectionsByInstance.has(id)) connectionsByInstance.set(id, new Set());
+  connectionsByInstance.get(id).add(pool.keyFor(target));
 }
 
 const sshTarget = (endpoint) => ({ host: endpoint.host, port: endpoint.port, username: 'root', privateKey: sshKey().privateKey });
@@ -131,8 +142,7 @@ async function execOnInstance(inst, command, { timeoutMs, signal, onProgress, st
       // Instances are short-lived and reuse host:port pairs, so known_hosts can't be trusted for them.
       const target = sshTarget(endpoint);
       const result = await pool.exec(target, command, { timeoutMs, signal, onProgress, stdoutLimit, hostKeys: { mode: 'off' } });
-      if (!connectionsByInstance.has(inst.id)) connectionsByInstance.set(inst.id, new Set());
-      connectionsByInstance.get(inst.id).add(pool.keyFor(target));
+      trackConnection(inst.id, target);
       return { endpoint, result };
     } catch (err) {
       if (signal?.aborted) throw err;
@@ -592,6 +602,150 @@ server.registerTool(
   safe(async ({ instance_id, actions, screenshot = true, wait_ms = 800, display }, extra) =>
     runDesktop(instance_id, { actions, screenshot, waitMs: wait_ms, display }, extra, `Ran ${actions.map((a) => a.action).join(', ')}`),
   ),
+);
+
+// ---- TuxBlox and Roblox Studio ------------------------------------------------
+
+const tuxbloxRepo = process.env.VAST_TUXBLOX_REPO || DEFAULT_TUXBLOX_REPO;
+const studioCommand = process.env.VAST_STUDIO_MCP_COMMAND || DEFAULT_STUDIO_MCP_COMMAND;
+const STUDIO_CONNECT_MS = 180_000;
+const STUDIO_CALL_MS = 300_000;
+// Connected clients of Roblox's Studio MCP server, per instance.
+const studioClients = new Map();
+
+server.registerTool(
+  'vast_install_tuxblox',
+  {
+    title: 'Install TuxBlox (Roblox Studio for Linux)',
+    description:
+      `Install TuxBlox, which runs Roblox Studio on Linux, on an instance from the latest GitHub release of ${tuxbloxRepo}. ` +
+      'It goes to ~/TuxBlox of the desktop user (not root). Afterwards start it with vast_desktop ' +
+      'launch "~/TuxBlox/TuxBloxLauncher"; the launcher installs Studio on its first start. ' +
+      'Also reports whether the host can run it (Linux kernel 6.7+ and a Vulkan driver). Running it again updates TuxBlox and keeps Studio.',
+    inputSchema: {
+      instance_id: instanceId,
+      tag: z.string().optional().describe('Release tag to install instead of the latest, e.g. "v3.1.0-fork.12"'),
+      user: z.string().regex(/^[a-z_][a-z0-9_-]{0,31}$/).optional().describe('Install for this user (default: the desktop session\'s user, or "user")'),
+    },
+    annotations: { destructiveHint: false, openWorldHint: true },
+  },
+  safe(async ({ instance_id, tag, user }, extra) => {
+    const inst = await requireInstance(instance_id, extra.signal);
+    if (instanceStatus(inst) !== 'running') {
+      return text(`Instance ${instance_id} is ${instanceStatus(inst)}, not running. Call vast_wait_for_instance first.`, true);
+    }
+    await attachKey(instance_id, extra.signal);
+    const script = tuxbloxInstallScript({ repo: tuxbloxRepo, tag, user, apiBase: process.env.VAST_TUXBLOX_API_URL });
+    const timeoutMs = 1_800_000;
+    const { result } = await execOnInstance(inst, script, { timeoutMs, signal: extra.signal, onProgress: progressReporter(extra) });
+    const failed = result.code !== 0 || result.timedOut;
+    const output = [result.stdout.trim(), result.stderr.trim()].filter(Boolean).join('\n');
+    if (failed) {
+      return text(`Installing TuxBlox on instance ${instance_id} failed${result.timedOut ? ' (timed out)' : ''}:\n${output}`, true);
+    }
+    return text(`${output}\n\nNext: vast_desktop with action "launch" and command "~/TuxBlox/TuxBloxLauncher", then vast_screenshot.`);
+  }),
+);
+
+/** Connects (once per instance) to Roblox's Studio MCP server on the instance, through TuxBlox's gateway. */
+async function studioClient(inst, signal) {
+  const cached = studioClients.get(inst.id);
+  if (cached) {
+    const client = await cached.catch(() => null);
+    if (client) return client;
+  }
+  const endpoints = sshEndpoints(inst);
+  if (!endpoints.length) throw new Error(`Instance ${inst.id} has no SSH address yet. Call vast_wait_for_instance first.`);
+  const connecting = (async () => {
+    const errors = [];
+    for (const endpoint of endpoints) {
+      const target = sshTarget(endpoint);
+      const transport = new SshStdioTransport(() => pool.spawn(target, sessionExecScript(studioCommand), { hostKeys: { mode: 'off' } }));
+      const client = new Client({ name: 'vast-studio-bridge', version: '1.0.0' });
+      try {
+        await client.connect(transport, { signal, timeout: STUDIO_CONNECT_MS });
+        trackConnection(inst.id, target);
+        client.onclose = () => {
+          if (studioClients.get(inst.id) === connecting) studioClients.delete(inst.id);
+        };
+        return client;
+      } catch (err) {
+        await client.close().catch(() => {});
+        if (signal?.aborted) throw err;
+        const said = transport.stderr.trim().split('\n').slice(-8).join('\n');
+        errors.push(said || `${endpoint.kind} ${endpoint.host}:${endpoint.port}: ${err.message}`);
+        // The gateway itself answered: another endpoint would say the same.
+        if (said) break;
+      }
+    }
+    throw new Error(`Could not start Roblox's Studio MCP server on instance ${inst.id}:\n${errors.join('\n')}`);
+  })();
+  studioClients.set(inst.id, connecting);
+  try {
+    return await connecting;
+  } catch (err) {
+    studioClients.delete(inst.id);
+    throw err;
+  }
+}
+
+const STUDIO_HELP =
+  'Studio must be installed with vast_install_tuxblox, started through TuxBlox and signed in. If the server is reported missing ' +
+  'or Studio is not connected, follow https://create.roblox.com/docs/studio/mcp inside Studio using vast_screenshot and vast_desktop.';
+
+server.registerTool(
+  'vast_studio_tools',
+  {
+    title: 'List Roblox Studio MCP tools',
+    description:
+      "List the tools of Roblox's own Studio MCP server running on an instance (through TuxBlox), with their arguments. " +
+      'Call them with vast_studio, e.g. to run Luau in Studio, create or edit scripts, or read the output. ' + STUDIO_HELP,
+    inputSchema: { instance_id: instanceId },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  },
+  safe(async ({ instance_id }, extra) => {
+    const inst = await requireInstance(instance_id, extra.signal);
+    await attachKey(instance_id, extra.signal);
+    const client = await studioClient(inst, extra.signal);
+    const { tools } = await client.listTools(undefined, { signal: extra.signal });
+    if (!tools.length) return text("Roblox's Studio MCP server offers no tools right now. Is Studio open and connected?");
+    const lines = tools.map((t) => {
+      const { $schema, ...schema } = t.inputSchema || {};
+      return `## ${t.name}${t.annotations?.readOnlyHint ? ' (read-only)' : ''}\n${t.description || ''}\narguments: ${JSON.stringify(schema)}`;
+    });
+    return text(`${lines.join('\n\n')}\n\nCall one with vast_studio(instance_id, tool, arguments).`);
+  }),
+);
+
+server.registerTool(
+  'vast_studio',
+  {
+    title: 'Use Roblox Studio',
+    description:
+      "Call a tool of Roblox's Studio MCP server on an instance (see vast_studio_tools for the tools and their arguments). " +
+      'This is the reliable way to script in Studio: create and edit scripts, run Luau, inspect the place and read output, ' +
+      'instead of clicking through the editor. ' + STUDIO_HELP,
+    inputSchema: {
+      instance_id: instanceId,
+      tool: z.string().describe('Tool name from vast_studio_tools'),
+      arguments: z.record(z.string(), z.any()).optional().describe('Arguments for the tool, as its schema describes'),
+    },
+    annotations: { destructiveHint: true, openWorldHint: true },
+  },
+  safe(async ({ instance_id, tool, arguments: args = {} }, extra) => {
+    const inst = await requireInstance(instance_id, extra.signal);
+    await attachKey(instance_id, extra.signal);
+    const client = await studioClient(inst, extra.signal);
+    const report = progressReporter(extra);
+    const result = await client.callTool({ name: tool, arguments: args }, undefined, {
+      signal: extra.signal,
+      timeout: STUDIO_CALL_MS,
+      resetTimeoutOnProgress: true,
+      onprogress: (p) => report(p.message || `${p.progress}${p.total ? `/${p.total}` : ''}`),
+    });
+    // Images, text and errors from Studio go back as they are.
+    return { content: result.content?.length ? result.content : [{ type: 'text', text: '(no output)' }], ...(result.isError ? { isError: true } : {}) };
+  }),
 );
 
 server.registerTool(

@@ -50,9 +50,9 @@ Then ask Claude, for example:
 
 > Rent a cheap Vast.ai desktop, install Roblox Studio with TuxBlox and open it. I'll sign in, then write a script that makes a part change color when touched.
 
-Claude finds the *Linux Desktop* template, rents a machine with an auto-destroy deadline, installs TuxBlox with `vast_exec`, launches Studio, and watches the screen with `vast_screenshot`. When Studio asks you to sign in, Claude stops and asks you to do it yourself: open the desktop in your browser from the instance's **Open** button at https://cloud.vast.ai/instances/. Claude never needs your Roblox password. After that it creates the script with `vast_desktop`, pasting code into the editor instead of typing it, and destroys the machine when you say you're done.
+Claude finds the *Linux Desktop* template, rents a machine with an auto-destroy deadline, installs TuxBlox with `vast_install_tuxblox`, starts the launcher (which installs Studio) and watches the screen with `vast_screenshot`. When Studio asks you to sign in, Claude stops and asks you to do it yourself: open the desktop in your browser from the instance's **Open** button at https://cloud.vast.ai/instances/. Claude never needs your Roblox password. Then it writes the script through Roblox's own Studio MCP server (`vast_studio`), and destroys the machine when you say you're done.
 
-Roblox Studio through TuxBlox only runs on hosts with Linux kernel 6.7 or newer and a working Vulkan driver, so Claude may need to try another machine. See [Vast.ai](#vastai).
+TuxBlox comes from the latest GitHub release of [4drvndrvndrvn/tuxblox](https://github.com/4drvndrvndrvn/tuxblox) (`VAST_TUXBLOX_REPO`), the `TuxBlox-…-linux-x86_64.tar.zst` file that repository's Build workflow publishes. It is extracted to `~/TuxBlox` of the desktop user. Roblox Studio through TuxBlox only runs on hosts with Linux kernel 6.7 or newer and a working Vulkan driver; `vast_install_tuxblox` checks both, and Claude rents another machine if they're missing.
 
 ## Approving tool calls
 
@@ -73,18 +73,15 @@ Then ask, for example:
 > Use the vast mcp: rent a cheap instance with a desktop image, download tuxblox on it, wait 10 seconds and then close the vast instance (destroy it).
 
 The model typically calls:
-1. `web_search` to find out what [TuxBlox](https://tuxblox.net) is (Roblox Studio on Linux) and how it's installed.
-2. `vast_search_templates`, which finds the official *Linux Desktop Container*.
-3. `vast_search_offers`.
-4. `vast_create_instance`, usually with an `auto_destroy_minutes` safety net.
-5. `vast_wait_for_instance`.
-6. `vast_exec` with `run_as_user: "user"`, running `curl -sSLf https://tuxblox.net/install.sh | bash`. TuxBlox's installer refuses to run as root, and instances are root by default.
-7. `wait`.
-8. `vast_destroy_instance`.
+1. `vast_search_templates`, which finds the official *Linux Desktop Container*.
+2. `vast_search_offers`.
+3. `vast_create_instance`, usually with an `auto_destroy_minutes` safety net.
+4. `vast_wait_for_instance`.
+5. `vast_install_tuxblox`, which downloads the latest release of [4drvndrvndrvn/tuxblox](https://github.com/4drvndrvndrvn/tuxblox) to `~/TuxBlox` of the desktop user (TuxBlox refuses to run as root) and checks the host.
+6. `wait`.
+7. `vast_destroy_instance`.
 
-Without `web_search`, models that don't know a program invent download URLs. Naming the source in the prompt (e.g. "tuxblox from https://tuxblox.net") works too.
-
-About TuxBlox itself: it's a new, small project whose installer is an unsigned binary. It only *runs* on hosts with Linux kernel 6.7 or newer and a Vulkan driver (`uname -r`, `vulkaninfo --summary`), and Roblox Studio needs you to sign in from the desktop session.
+About TuxBlox itself: it's a new, small project. It only *runs* on hosts with Linux kernel 6.7 or newer and a Vulkan driver, and Roblox Studio needs you to sign in from the desktop session. The fork's releases are built by its own GitHub Actions workflow; the launcher's Auto-Update setting is off by default, and should stay off, since it updates from the official TuxBlox server and would replace the fork's build.
 
 | Tool | What it does |
 | --- | --- |
@@ -95,6 +92,8 @@ About TuxBlox itself: it's a new, small project whose installer is an unsigned b
 | `vast_exec` | Runs a shell command on the machine, as root or, with `run_as_user`, as a normal user (created if missing) for installers that refuse root. |
 | `vast_screenshot` | Takes a screenshot of the instance's desktop (desktop templates). |
 | `vast_desktop` | Clicks, drags, scrolls, types, pastes, presses keys and launches apps on the desktop, then returns a screenshot. Coordinates are in the screenshot's pixels. |
+| `vast_install_tuxblox` | Installs TuxBlox (Roblox Studio on Linux) from the latest release of `VAST_TUXBLOX_REPO`, or a given `tag`, and checks the kernel and Vulkan. |
+| `vast_studio_tools`, `vast_studio` | List and call the tools of Roblox's Studio MCP server on the instance (create and edit scripts, run Luau, read output), through TuxBlox's `studio-mcp` gateway over SSH. |
 | `vast_instance_logs` | Shows the container log. |
 | `vast_list_instances`, `vast_get_instance`, `vast_account` | Status, SSH address, price and remaining credit. |
 | `vast_start_instance`, `vast_stop_instance`, `vast_reboot_instance`, `vast_destroy_instance` | Lifecycle. Destroying deletes the machine and its data and stops billing. |
@@ -103,6 +102,7 @@ About TuxBlox itself: it's a new, small project whose installer is an unsigned b
 - The server creates its own SSH key (`.data/vast_ed25519`) and attaches it to each instance it creates, so `vast_exec` works without any SSH setup.
 - **Safety nets:** `auto_destroy_minutes` on `vast_create_instance` (or `VAST_AUTO_DESTROY_MINUTES` for all instances) destroys a machine even if the model never gets to it. Deadlines are saved in `.data/`, so one that passed while the app was off runs on the next start. `VAST_MAX_PRICE_PER_HOUR` refuses offers above that price.
 - The desktop tools find the X display the desktop session uses and install `xdotool`, `xclip` and ImageMagick on the instance the first time. Apps started with the `launch` action run as the desktop's user, in its session. Screenshots are scaled to `VAST_SCREENSHOT_WIDTH` (1280) pixels wide.
+- `vast_studio` runs `~/TuxBlox/studio-mcp` as the desktop user over SSH and keeps the connection per instance. Studio has to be running and signed in. If the gateway says Roblox's Studio MCP server isn't installed, Claude follows [Roblox's guide](https://create.roblox.com/docs/studio/mcp) inside Studio with the desktop tools.
 - With a template, the template's own startup script is kept. Run your commands with `vast_exec` after `vast_wait_for_instance`.
 
 ## SSH
@@ -194,6 +194,7 @@ Clients that only support stdio can use [`mcp-remote`](https://www.npmjs.com/pac
 | `SSH_ALLOWED_HOSTS` | any | Comma-separated hostname patterns the model may connect to. |
 | `SSH_DEFAULT_USER` | `root` | User when none is given. |
 | `SSH_STRICT_HOST_KEY_CHECKING` | — | `yes` refuses hosts that aren't in known_hosts. |
+| `VAST_TUXBLOX_REPO` | `4drvndrvndrvn/tuxblox` | GitHub repository whose releases `vast_install_tuxblox` installs. |
 | `VAST_SCREENSHOT_WIDTH` | `1280` | Desktop screenshots wider than this are scaled down. |
 | `WEB_SEARCH_MODEL` | `openai/gpt-5.4-mini:online` | Model used by `web_search` (any NanoGPT model id with `:online`). |
 

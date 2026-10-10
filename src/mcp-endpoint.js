@@ -22,8 +22,10 @@ To work in a graphical Linux desktop (for example to run Roblox Studio):
 from the instance's "Open" button at https://cloud.vast.ai/instances/. Never ask for their password.
 5. Destroy the instance when the user is done with it.
 
-Roblox Studio on Linux: TuxBlox (https://tuxblox.net) installs it with \`curl -sSLf https://tuxblox.net/install.sh | bash\` \
-as a normal user. It needs Linux kernel 6.7+ and a Vulkan driver on the host (check uname -r and vulkaninfo --summary).`;
+Roblox Studio (runs on Linux through TuxBlox):
+1. Rent a desktop as above, then vast_install_tuxblox. It reports whether the host can run Studio (Linux kernel 6.7+ and a Vulkan driver); if not, destroy the instance and rent another one.
+2. vast_desktop with action "launch" and command "~/TuxBlox/TuxBloxLauncher"; the launcher installs and starts Studio. Watch with vast_screenshot, and have the user sign in (step 4 above).
+3. Script with vast_studio_tools and vast_studio, which use Roblox's own Studio MCP server: create and edit scripts, run Luau and read the output there instead of clicking through the editor. Fall back to vast_desktop only for what it can't do.`;
 
 const chatInput = z.object({
   prompt: z.string().describe('The user prompt'),

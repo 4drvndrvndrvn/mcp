@@ -277,3 +277,98 @@ test('vast_screenshot and vast_desktop drive the desktop over SSH', { skip: !has
     xvfb.kill();
   }
 });
+
+const canInstall = process.getuid?.() === 0 && spawnSync('sh', ['-c', 'command -v zstd && command -v runuser']).status === 0;
+
+test('vast_install_tuxblox installs the latest GitHub release for the desktop user', { skip: !canInstall && 'needs root and zstd' }, async () => {
+  // A fake GitHub API and release download.
+  const bundle = fs.mkdtempSync(path.join(os.tmpdir(), 'tuxblox-bundle-'));
+  fs.mkdirSync(path.join(bundle, 'TuxBlox'));
+  fs.writeFileSync(path.join(bundle, 'TuxBlox/TuxBloxLauncher'), '#!/bin/sh\necho launcher\n', { mode: 0o755 });
+  const archive = path.join(bundle, 'tb.tar.zst');
+  assert.equal(spawnSync('sh', ['-c', `tar -C ${bundle} -cf - TuxBlox | zstd -q -o ${archive}`]).status, 0);
+  const seen = [];
+  const http = (await import('node:http')).createServer((req, res) => {
+    seen.push(req.url);
+    const base = `http://127.0.0.1:${http.address().port}`;
+    if (req.url === '/repos/4drvndrvndrvn/tuxblox/releases/latest') {
+      res.setHeader('content-type', 'application/json');
+      return res.end(JSON.stringify({
+        tag_name: 'v3.1.0-fork.7',
+        assets: [{ browser_download_url: `${base}/dl/TuxBlox-3.1.0-abc1234-linux-x86_64.tar.zst` }],
+      }, null, 2));
+    }
+    if (req.url.startsWith('/dl/')) return res.end(fs.readFileSync(archive));
+    res.statusCode = 404;
+    res.end('{}');
+  });
+  await new Promise((resolve) => http.listen(0, '127.0.0.1', resolve));
+  const { client, call } = await connect({ VAST_API_KEY: 'test-key', VAST_TUXBLOX_API_URL: `http://127.0.0.1:${http.address().port}` });
+  const user = 'tbtest';
+  try {
+    const id = Number((await call('vast_create_instance', { offer_id: 1001, template_hash: DESKTOP_TEMPLATE.hash_id })).text.match(/Created instance (\d+)/)[1]);
+    await call('vast_wait_for_instance', { instance_id: id, timeout_seconds: 30 });
+    const installed = await call('vast_install_tuxblox', { instance_id: id, user });
+    assert.equal(installed.isError, false, installed.text);
+    assert.match(installed.text, /Installed TuxBlox v3\.1\.0-fork\.7 from 4drvndrvndrvn\/tuxblox for user tbtest/);
+    assert.match(installed.text, /Kernel .*(OK|WARNING)/);
+    const home = spawnSync('getent', ['passwd', user], { encoding: 'utf8' }).stdout.split(':')[5];
+    const launcher = path.join(home, 'TuxBlox/TuxBloxLauncher');
+    assert.ok(fs.statSync(launcher).mode & 0o100, 'launcher is executable');
+    assert.equal(spawnSync('stat', ['-c', '%U', launcher], { encoding: 'utf8' }).stdout.trim(), user);
+    assert.ok(seen.includes('/repos/4drvndrvndrvn/tuxblox/releases/latest'));
+
+    const missing = await call('vast_install_tuxblox', { instance_id: id, user, tag: 'v0-nope' });
+    assert.equal(missing.isError, true);
+    assert.match(missing.text, /No release found/);
+    await call('vast_destroy_instance', { instance_id: id });
+  } finally {
+    await client.close();
+    http.close();
+    spawnSync('userdel', ['-r', user]);
+    fs.rmSync(bundle, { recursive: true, force: true });
+  }
+});
+
+test('vast_studio_tools and vast_studio talk to the Studio MCP server on the instance over SSH', async () => {
+  // Stands in for TuxBlox's studio-mcp gateway: any stdio MCP server.
+  const studio = `${process.execPath} ${path.join(ROOT, 'test/helpers/progress-server.js')}`;
+  const { client, call } = await connect({ VAST_API_KEY: 'test-key', VAST_STUDIO_MCP_COMMAND: studio });
+  try {
+    const id = Number((await call('vast_create_instance', { offer_id: 1001, image: 'ubuntu' })).text.match(/Created instance (\d+)/)[1]);
+    await call('vast_wait_for_instance', { instance_id: id, timeout_seconds: 30 });
+
+    const tools = await call('vast_studio_tools', { instance_id: id });
+    assert.equal(tools.isError, false, tools.text);
+    assert.match(tools.text, /## count\nCounts to 3/);
+
+    const progress = [];
+    const r = await client.callTool({ name: 'vast_studio', arguments: { instance_id: id, tool: 'count' } }, undefined, {
+      onprogress: (p) => progress.push(p.message),
+    });
+    assert.equal(r.content[0].text, 'counted');
+    assert.deepEqual(progress, ['step 1', 'step 2', 'step 3']);
+
+    // The connection is reused, and an unknown tool comes back as an error.
+    const bad = await call('vast_studio', { instance_id: id, tool: 'nope' });
+    assert.equal(bad.isError, true);
+    await call('vast_destroy_instance', { instance_id: id });
+  } finally {
+    await client.close();
+  }
+});
+
+test('vast_studio explains what the gateway says when Studio MCP is missing', async () => {
+  const studio = `echo "TuxBlox: Roblox's Studio MCP server is not installed." >&2; exit 1`;
+  const { client, call } = await connect({ VAST_API_KEY: 'test-key', VAST_STUDIO_MCP_COMMAND: studio });
+  try {
+    const id = Number((await call('vast_create_instance', { offer_id: 1001, image: 'ubuntu' })).text.match(/Created instance (\d+)/)[1]);
+    await call('vast_wait_for_instance', { instance_id: id, timeout_seconds: 30 });
+    const r = await call('vast_studio_tools', { instance_id: id });
+    assert.equal(r.isError, true);
+    assert.match(r.text, /Studio MCP server is not installed/);
+    await call('vast_destroy_instance', { instance_id: id });
+  } finally {
+    await client.close();
+  }
+});
